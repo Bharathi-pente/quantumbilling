@@ -79,7 +79,7 @@ func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen-14] + "... (truncated)"
+	return s[:maxLen-15] + "... (truncated)"
 }
 
 // ValidViolationTypes returns the valid violation_type values.

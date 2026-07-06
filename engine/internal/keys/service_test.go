@@ -14,8 +14,8 @@ func TestTC01_KeyGeneration(t *testing.T) {
 	if !strings.HasPrefix(raw, "sk-live-") {
 		t.Errorf("expected sk-live- prefix, got %s", raw[:min(11, len(raw))])
 	}
-	if len(raw) != 75 { // 11 (sk-live-) + 64 hex
-		t.Errorf("expected 75 chars, got %d", len(raw))
+	if len(raw) != 72 { // 8 (sk-live-) + 64 hex (32 random bytes)
+		t.Errorf("expected 72 chars, got %d", len(raw))
 	}
 	if len(prefix) != 11 {
 		t.Errorf("expected 11-char prefix, got %d: %s", len(prefix), prefix)

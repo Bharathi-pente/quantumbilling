@@ -1,0 +1,1 @@
+{"event_id":"evt-test-002","org_id":"00000000-0000-0000-0000-000000000001","customer_id":"00000000-0000-0000-0000-000000000002","source_mode":"direct_ingest","key_id":"dev-key-001","event_type":"chat.completion","model":"gpt-4","input_tokens":100,"output_tokens":50,"total_tokens":150,"cost":"0.0015","status":"success","timestamp_ms":1751800000000}

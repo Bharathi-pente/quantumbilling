@@ -5,6 +5,7 @@ package auth
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -32,9 +33,9 @@ type authError struct {
 	message    string
 }
 
-func (e *authError) Error() string      { return e.message }
-func (e *authError) StatusCode() int    { return e.statusCode }
-func (e *authError) ErrorCode() string   { return e.errorCode }
+func (e *authError) Error() string     { return e.message }
+func (e *authError) StatusCode() int   { return e.statusCode }
+func (e *authError) ErrorCode() string { return e.errorCode }
 
 var (
 	ErrKeyNotFound            = &authError{401, "UNAUTHORIZED", "invalid API key"}
@@ -109,7 +110,8 @@ func AuthMiddleware(rdb *redis.Client, log *slog.Logger) func(http.Handler) http
 
 			kc, err := ValidateAPIKey(r.Context(), rdb, rawKey)
 			if err != nil {
-				if ae, ok := err.(AuthError); ok {
+				var ae AuthError
+				if errors.As(err, &ae) {
 					log.Warn("auth failed",
 						"key_prefix", MaskKey(rawKey),
 						"error_code", ae.ErrorCode(),

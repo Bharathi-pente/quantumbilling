@@ -5,7 +5,6 @@
 package analytics
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -93,13 +92,13 @@ type OrgSummary struct {
 }
 
 type BreakdownItem struct {
-	GroupValue    string  `json:"group_value"`
-	RequestsCount int     `json:"requests_count"`
-	InputTokens   int64   `json:"input_tokens"`
-	OutputTokens  int64   `json:"output_tokens"`
-	ThinkingTokens int64  `json:"thinking_tokens"`
-	TotalTokens   float64 `json:"total_tokens"`
-	Cost          string  `json:"cost"`
+	GroupValue     string  `json:"group_value"`
+	RequestsCount  int     `json:"requests_count"`
+	InputTokens    int64   `json:"input_tokens"`
+	OutputTokens   int64   `json:"output_tokens"`
+	ThinkingTokens int64   `json:"thinking_tokens"`
+	TotalTokens    float64 `json:"total_tokens"`
+	Cost           string  `json:"cost"`
 }
 
 type UsageBreakdown struct {
@@ -120,13 +119,13 @@ type Pagination struct {
 }
 
 type TrendPoint struct {
-	Timestamp     string  `json:"timestamp"`
-	RequestsCount int     `json:"requests_count"`
-	InputTokens   int64   `json:"input_tokens"`
-	OutputTokens  int64   `json:"output_tokens"`
-	ThinkingTokens int64  `json:"thinking_tokens"`
-	TotalTokens   float64 `json:"total_tokens"`
-	Cost          string  `json:"cost"`
+	Timestamp      string  `json:"timestamp"`
+	RequestsCount  int     `json:"requests_count"`
+	InputTokens    int64   `json:"input_tokens"`
+	OutputTokens   int64   `json:"output_tokens"`
+	ThinkingTokens int64   `json:"thinking_tokens"`
+	TotalTokens    float64 `json:"total_tokens"`
+	Cost           string  `json:"cost"`
 }
 
 type TrendSeries struct {
@@ -156,8 +155,8 @@ func (s *Service) OrgSummary(w http.ResponseWriter, r *http.Request) {
 func (s *Service) OrgCustomersUsage(w http.ResponseWriter, r *http.Request) {
 	orgID := pathParam(r, 3)
 	resp := UsageBreakdownPage{
-		Totals: Totals{Cost: "0.000000"},
-		Series: []BreakdownItem{},
+		Totals:     Totals{Cost: "0.000000"},
+		Series:     []BreakdownItem{},
 		Pagination: Pagination{Limit: 100, Offset: 0, Total: 0},
 	}
 	_ = orgID
@@ -305,16 +304,24 @@ func buildOrgSummaryQuery(orgID, from, to string) string {
 }
 
 func fromDateMs(d string) string {
-	if d == "" { return "0" }
+	if d == "" {
+		return "0"
+	}
 	t, err := time.Parse("2006-01-02", d)
-	if err != nil { return "0" }
+	if err != nil {
+		return "0"
+	}
 	return fmt.Sprintf("%d", t.UnixMilli())
 }
 
 func toDateMs(d string) string {
-	if d == "" { return fmt.Sprintf("%d", time.Now().UnixMilli()) }
+	if d == "" {
+		return fmt.Sprintf("%d", time.Now().UnixMilli())
+	}
 	t, err := time.Parse("2006-01-02", d)
-	if err != nil { return fmt.Sprintf("%d", time.Now().UnixMilli()) }
+	if err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixMilli())
+	}
 	return fmt.Sprintf("%d", t.Add(24*time.Hour).UnixMilli()-1)
 }
 
