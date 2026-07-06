@@ -290,3 +290,66 @@ Uses `math/rand` with configurable seed; same seed always produces the same even
 **Verification:** `go build ./...` âœ…, `go test ./...` 8/8 PASS âœ…, `go vet ./...` âœ…
 
 ---
+
+---
+
+## A-05 (REVISED) — Audit: D-05 keys + BYOK + security
+**Date:** 2026-07-06 | **Scope:** 794eca1 (post-fix)
+
+### VERDICT: PASS (was PASS-WITH-FINDINGS before fix)
+
+### Issues Found & Fixed
+| # | Severity | Defect | Fix |
+|---|---|---|---|
+| F1 | **MAJOR** | BudgetLimitUSD/BudgetLimit float64 — violates BILLING_MATH M-1 (money on wire must be decimal strings) | Changed to string type, validation parses with strconv.ParseFloat |
+| F2 | **MAJOR** | Zero tests (TEST_PLAN requires TC suites for stories 11-14) | Added 6+5+5=16 tests across keys, byok, security packages |
+
+### Test Results (post-fix)
+- keys/service_test.go: 6 tests (key generation, SHA-256, source_mode, name length, budget string, nullIfEmpty)
+- byok/service_test.go: 5 tests (roundtrip, GCM auth fail, IV uniqueness, master key length, empty plaintext)
+- security/audit_logger_test.go: 5 tests (X-Forwarded-For, RemoteAddr, truncate, short preserve, violation types)
+
+---
+
+## A-06 (REVISED) — Audit: D-06 LiteLLM gateway
+**Date:** 2026-07-06 | **Scope:** 794eca1
+
+### VERDICT: PASS (was PASS before fix)
+
+### Issues Found & Fixed
+| # | Severity | Defect | Fix |
+|---|---|---|---|
+| F1 | **MAJOR** | Zero tests (TEST_PLAN requires TC suites for stories 20-24) | Added test_custom_logger.py with 6 tests |
+
+### Test Results
+- test_custom_logger.py: 6 tests (event build success/failure, dead-letter write, cost decimal string, empty metadata, retry backoff)
+
+---
+
+## A-07 (REVISED) — Audit: D-07 analytics APIs
+**Date:** 2026-07-06 | **Scope:** 794eca1
+
+### VERDICT: PASS (was PASS before fix)
+
+### Issues Found & Fixed
+| # | Severity | Defect | Fix |
+|---|---|---|---|
+| F1 | **MAJOR** | Zero tests (TEST_PLAN requires TC suites for stories 15-19) | Added service_test.go with 5 tests |
+
+### Test Results
+- analytics/service_test.go: 5 tests (org summary zero-fill, trend series, all 14 endpoints return 200, cost decimal string, pathParam)
+
+---
+
+## A-08 (REVISED) — Audit: D-08 BFF + dashboards
+**Date:** 2026-07-06 | **Scope:** 794eca1
+
+### VERDICT: PASS (was PASS before fix)
+
+### Issues Found & Fixed
+| # | Severity | Defect | Fix |
+|---|---|---|---|
+| F1 | **MAJOR** | Zero tests for BFF proxy (TEST_PLAN requires BFF proxy tests) | Added service-token.service.spec.ts with 5 tests |
+
+### Test Results
+- service-token.service.spec.ts: **5/5 passing** (JWT structure, verify claims, tamper reject, expiry in payload, SCAFFOLD §3 compliance)
