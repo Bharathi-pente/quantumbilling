@@ -1,12 +1,25 @@
-# QuantumBilling LiteLLM development stub.
-# D-06 replaces/extends this with model routing, callbacks, and hooks.
+# QuantumBilling LiteLLM proxy configuration (D-06).
+# Replaces the D-00 stub with model routing, custom callbacks, and hooks.
 model_list:
   - model_name: qb-echo
     litellm_params:
       model: openai/gpt-4o-mini
       api_key: os.environ/OPENAI_API_KEY
+  - model_name: qb-mock
+    litellm_params:
+      model: openai/mock
+      api_key: os.environ/OPENAI_API_KEY
+
 litellm_settings:
   drop_params: true
   set_verbose: false
+  success_callback: ["custom_logger"]
+  failure_callback: ["custom_logger"]
+
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
+
+router_settings:
+  allowed_fails: 10
+  num_retries: 2
+  cooldown_time: 30
