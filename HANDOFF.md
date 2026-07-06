@@ -183,3 +183,10 @@ px tsc-style review for syntax.
   - Enable gateway profile and test end-to-end with mock provider
   - Story_23 BYOK decryption hook
   - Story_22 budget/rate-limit sync
+
+## D-07 — Track B: analytics APIs (Phase 4)
+- BASE_SHA / COMMIT_SHA: ca55499 / dec5959
+- Summary: Built analytics API with 18 read endpoints over ClickHouse dedup view. Zero-fill guarantee, 5s timeout, =10 parallel queries. Service token auth per SCAFFOLD §3.
+- Files changed: 2 new files (analytics/service.go, cmd/analytics-api/main.go)
+- 18 endpoints: Org (summary, customers usage, models usage, services usage, cost) + Customer (summary, end-users usage, models usage, cost) + EndUser (summary, daily) + Trends (hourly/daily/weekly/monthly) + Platform (models, services, cost)
+- Deviations: ClickHouse queries are templates (real clickhouse-go driver pending Go deps). Auth is HMAC placeholder.
