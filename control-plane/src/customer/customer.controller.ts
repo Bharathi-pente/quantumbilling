@@ -16,7 +16,7 @@ export class CustomerController {
   @UseGuards(OrgAdminGuard)
   create(@Body() dto: CreateCustomerDto, @Req() req: Request) {
     const orgId = extractOrgId(req.user as any);
-    const actorId = (req.user as any)?.sub ?? 'unknown';
+    const actorId = (req.user as any)?.sub || null;
     return this.customerService.create(dto, orgId, actorId);
   }
 
@@ -36,7 +36,7 @@ export class CustomerController {
   @Patch(':customerId')
   @UseGuards(OrgAdminGuard)
   update(@Param('customerId', ParseUUIDPipe) id: string, @Body() dto: UpdateCustomerDto, @Req() req: Request) {
-    const actorId = (req.user as any)?.sub ?? 'unknown';
+    const actorId = (req.user as any)?.sub || null;
     return this.customerService.update(id, dto, actorId);
   }
 }

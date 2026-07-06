@@ -17,7 +17,7 @@ export class EndUserController {
   create(@Body() dto: CreateEndUserDto, @Req() req: Request) {
     const orgId = extractOrgId(req.user as any);
     const customerId = extractCustomerId(req.user as any) ?? dto['customer_id'];
-    const actorId = (req.user as any)?.sub ?? 'unknown';
+    const actorId = (req.user as any)?.sub || null;
     return this.endUserService.create(dto, orgId, customerId, actorId);
   }
 
@@ -42,7 +42,7 @@ export class EndUserController {
   @Patch(':endUserId')
   @UseGuards(OrgAdminGuard)
   update(@Param('endUserId', ParseUUIDPipe) id: string, @Body() dto: UpdateEndUserDto, @Req() req: Request) {
-    const actorId = (req.user as any)?.sub ?? 'unknown';
+    const actorId = (req.user as any)?.sub || null;
     return this.endUserService.update(id, dto, actorId);
   }
 }

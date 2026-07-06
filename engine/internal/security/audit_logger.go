@@ -4,7 +4,6 @@ package security
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -91,7 +90,9 @@ func ValidViolationTypes() []string {
 // IsValidViolationType checks if a type string is valid.
 func IsValidViolationType(t string) bool {
 	for _, v := range ValidViolationTypes() {
-		if v == t { return true }
+		if v == t {
+			return true
+		}
 	}
 	return false
 }

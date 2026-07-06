@@ -4,6 +4,7 @@
 package models
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -28,10 +29,10 @@ const (
 // Defaults (story_1 AC 31)
 // ---------------------------------------------------------------------------
 const (
-	DefaultIdempotencyTTL  = 24 * time.Hour
-	DefaultMaxBatchSize    = 50000
-	DefaultMaxBodySize     = 1 << 20      // 1 MB
-	DefaultMaxBatchBodySize = 500 << 20    // 500 MB
+	DefaultIdempotencyTTL   = 24 * time.Hour
+	DefaultMaxBatchSize     = 50000
+	DefaultMaxBodySize      = 1 << 20   // 1 MB
+	DefaultMaxBatchBodySize = 500 << 20 // 500 MB
 )
 
 // ---------------------------------------------------------------------------
@@ -53,7 +54,7 @@ type UsageEvent struct {
 	TotalTokens    float64           `json:"total_tokens"`
 	Unit           string            `json:"unit,omitempty"`
 	Latency        string            `json:"latency,omitempty"`
-	Cost           string            `json:"cost,omitempty"`       // decimal as string (M-1)
+	Cost           string            `json:"cost,omitempty"` // decimal as string (M-1)
 	Status         string            `json:"status,omitempty"`
 	Service        string            `json:"service,omitempty"`
 	TimestampMs    int64             `json:"timestamp_ms,omitempty"`
@@ -151,7 +152,17 @@ func ParseIngestBatch(body []byte) ([]UsageEvent, error) {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+// newEventID generates a UUIDv4 string per SCAFFOLD.md §6.
+// Uses crypto/rand — no external dependency required.
 func newEventID() string {
-	// Generates a simple unique ID; replace with UUID in production.
-	return fmt.Sprintf("evt_%d", time.Now().UnixNano())
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		// Fallback: timestamp-based ID if crypto/rand fails (should never happen)
+		return fmt.Sprintf("evt_%d", time.Now().UnixNano())
+	}
+	// Set UUIDv4 variant bits: version 4 (0100) in byte 6, variant 10xx in byte 8
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
 }

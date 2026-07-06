@@ -2,7 +2,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -22,9 +21,9 @@ import (
 )
 
 var (
-	logger *slog.Logger
-	keySvc *keys.Service
-	byokSvc *byok.Service
+	logger      *slog.Logger
+	keySvc      *keys.Service
+	byokSvc     *byok.Service
 	auditLogger *security.AuditLogger
 )
 
@@ -43,7 +42,9 @@ func main() {
 	pg.SetMaxOpenConns(10)
 
 	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" { redisAddr = "localhost:6379" }
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr, DialTimeout: 2 * time.Second})
 
 	keySvc = keys.NewService(pg, rdb, logger)
@@ -59,7 +60,9 @@ func main() {
 	mux.HandleFunc("/v1/security-audit-logs", handleSecurityAuditLogs)
 
 	port := os.Getenv("PORT")
-	if port == "" { port = "8013" }
+	if port == "" {
+		port = "8013"
+	}
 
 	go func() {
 		sigCh := make(chan os.Signal, 1)
@@ -188,7 +191,9 @@ func contains(s, substr string) bool {
 
 func findSub(s, sub string) bool {
 	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub { return true }
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
 	}
 	return false
 }
@@ -202,7 +207,9 @@ func extractCode(msg string) string {
 
 func findIndex(s, sub string) int {
 	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub { return i }
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
 	}
 	return -1
 }

@@ -15,7 +15,7 @@ export class IdentityController {
   @Post()
   @UseGuards(SuperAdminGuard)
   create(@Body() dto: CreateOrganizationDto, @Req() req: Request) {
-    const actorId = (req.user as any)?.sub ?? 'unknown';
+    const actorId = (req.user as any)?.sub || null;
     return this.identityService.create(dto, actorId);
   }
 
@@ -38,7 +38,7 @@ export class IdentityController {
     @Body() dto: UpdateOrganizationDto,
     @Req() req: Request,
   ) {
-    const actorId = (req.user as any)?.sub ?? 'unknown';
+    const actorId = (req.user as any)?.sub || null;
     return this.identityService.update(id, dto, actorId);
   }
 
@@ -49,7 +49,7 @@ export class IdentityController {
     @Query('force') force = 'false',
     @Req() req: Request,
   ) {
-    const actorId = (req.user as any)?.sub ?? 'unknown';
+    const actorId = (req.user as any)?.sub || null;
     return this.identityService.suspend(id, force === 'true', actorId);
   }
 }

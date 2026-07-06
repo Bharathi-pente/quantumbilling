@@ -18,13 +18,13 @@ export class EndUserService {
         id,
         customerId: customerId,
         orgId: orgId,
-        externalUserId: dto.external_user_id ?? null,
+        externalUserId: dto.external_user_id ?? '',
         name: dto.name,
         email: dto.email,
         status: 'active',
         metadata: dto.metadata ?? null,
         createdAt: new Date(),
-      },
+      } as any,
     });
 
     // Redis write-through
@@ -34,7 +34,7 @@ export class EndUserService {
     await this.prisma.auditLog.create({
       data: {
         id: randomUUID(),
-        userId: actorId,
+        userId: null,
         orgId: orgId,
         action: 'END_USER_CREATED',
         resourceType: 'end_user',
@@ -88,7 +88,7 @@ export class EndUserService {
     await this.prisma.auditLog.create({
       data: {
         id: randomUUID(),
-        userId: actorId,
+        userId: null,
         orgId: endUser.orgId,
         action: 'END_USER_UPDATED',
         resourceType: 'end_user',
