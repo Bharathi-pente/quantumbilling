@@ -190,3 +190,10 @@ px tsc-style review for syntax.
 - Files changed: 2 new files (analytics/service.go, cmd/analytics-api/main.go)
 - 18 endpoints: Org (summary, customers usage, models usage, services usage, cost) + Customer (summary, end-users usage, models usage, cost) + EndUser (summary, daily) + Trends (hourly/daily/weekly/monthly) + Platform (models, services, cost)
 - Deviations: ClickHouse queries are templates (real clickhouse-go driver pending Go deps). Auth is HMAC placeholder.
+
+## D-08 — Track B: BFF proxy + dashboards (session 1)
+- BASE_SHA / COMMIT_SHA: 2870ad6 / bdebd09
+- Summary: Built BFF usage proxy — validates Keycloak JWT ? resolves scope ? mints 60s HS256 service token ? forwards to Go analytics-api with trusted headers. Redis caching for platform analytics (60s TTL). Session 1 complete (deliverable 1).
+- Files changed: 4 new files (bff module), app.module.ts updated, @nestjs/axios installed
+- Done: 13 proxy endpoints under /api/v1/usage/* mapping to analytics-api paths. Service token never reaches browser.
+- Session 2 (D-08 continued): web/ dashboards (5 pages) + Playwright e2e
