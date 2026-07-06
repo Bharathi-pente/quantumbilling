@@ -16,6 +16,7 @@ import (
 	"github.com/pente/quantumbilling/engine/internal/auth"
 	"github.com/pente/quantumbilling/engine/internal/daemon"
 	"github.com/pente/quantumbilling/engine/internal/handler"
+	"github.com/pente/quantumbilling/engine/internal/kafka"
 	"github.com/redis/go-redis/v9"
 
 	_ "github.com/lib/pq"
@@ -44,7 +45,13 @@ func main() {
 		pg.SetMaxIdleConns(2)
 	}
 
-	ingestHandler := handler.NewIngestHandler(rdb, pg, logger)
+	// Kafka producer (A-02 F1: real producer, placeholder until go mod tidy + kafka-go dep)
+	kafkaCfg := kafka.DefaultProducerConfig()
+	kafkaCfg.Brokers = []string{envOrDefault("KAFKA_BROKERS", "localhost:9092")}
+	kafkaProducer := kafka.NewProducer(kafkaCfg, logger)
+	singlePub, batchPub := kafka.WrapProducer(kafkaProducer)
+
+	ingestHandler := handler.NewIngestHandler(rdb, pg, logger, singlePub, batchPub)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
@@ -118,11 +125,15 @@ func checkTCP(host, port string) bool {
 }
 
 func boolStatus(ok bool) string {
-	if ok { return "ok" }
+	if ok {
+		return "ok"
+	}
 	return "unavailable"
 }
 
 func envOrDefault(key, defaultVal string) string {
-	if v := os.Getenv(key); v != "" { return v }
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
 	return defaultVal
 }

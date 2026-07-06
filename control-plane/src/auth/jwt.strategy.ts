@@ -18,10 +18,12 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
-      // Keycloak public key — in production fetch from JWKS endpoint
+      // A-01 F4: DEV-ONLY — validates HS256 tokens signed with the dev client secret.
+      // PRODUCTION TODO: Replace with Keycloak JWKS endpoint (RS256):
+      //   secretOrKeyProvider: passportJwtSecret({
+      //     cache: true, rateLimit: true, jwksUri: `${keycloakUrl}/realms/quantumbilling/protocol/openid-connect/certs`,
+      //   }),
       secretOrKeyProvider: (_request, _rawJwtToken, done) => {
-        // Dev mode: accept any HS256 token signed with the dev secret
-        // Production: validate against Keycloak's RS256 public key
         const secret = process.env.KEYCLOAK_CLIENT_SECRET ?? 'dev-bff-client-secret';
         done(null, secret);
       },

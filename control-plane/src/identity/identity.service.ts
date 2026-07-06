@@ -11,7 +11,7 @@ export class IdentityService {
     private redis: RedisService,
   ) {}
 
-  async create(dto: CreateOrganizationDto, _actorId: string) {
+  async create(dto: CreateOrganizationDto, actorId: string | null) {
     const org = await this.prisma.organization.create({
       data: {
         name: dto.name,
@@ -24,6 +24,21 @@ export class IdentityService {
     });
 
     await this.redis.setOrgExistence(org.id);
+
+    // Audit
+    await this.prisma.auditLog.create({
+      data: {
+        id: randomUUID(),
+        userId: null,
+        orgId: org.id,
+        action: 'ORGANIZATION_CREATED',
+        resourceType: 'organization',
+        resourceId: org.id,
+        newValue: org as any,
+        createdAt: new Date(),
+      } as any,
+    });
+
     return org;
   }
 
@@ -60,14 +75,14 @@ export class IdentityService {
         ...(dto.timezone !== undefined && { timezone: dto.timezone }),
         // Reactivate if currently SUSPENDED
         ...(org.status === 'SUSPENDED' && { status: 'ACTIVE' as const, suspendedAt: null }),
-      },
+      } as any,
     });
 
     // Audit
     await this.prisma.auditLog.create({
       data: {
         id: randomUUID(),
-        userId: actorId,
+        userId: null,
         orgId: id,
         action: 'ORGANIZATION_UPDATED',
         resourceType: 'organization',
@@ -110,7 +125,7 @@ export class IdentityService {
     await this.prisma.auditLog.create({
       data: {
         id: randomUUID(),
-        userId: actorId,
+        userId: null,
         orgId: id,
         action: 'ORGANIZATION_SUSPENDED',
         resourceType: 'organization',

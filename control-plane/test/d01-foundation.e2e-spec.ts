@@ -9,7 +9,7 @@ import { RolesGuard } from '../src/auth/roles.guard';
 
 function jwtUser(roles: string[], orgId?: string, customerId?: string) {
   return {
-    sub: 'test-user-id',
+    sub: '11111111-1111-1111-1111-111111111111',
     email: 'test@quantumbilling.local',
     preferred_username: 'testuser',
     realm_access: { roles },
@@ -56,6 +56,10 @@ describe('D-01: Control-Plane Foundation (e2e)', () => {
   let customerId: string;
 
   beforeAll(async () => {
+    // Ensure DATABASE_URL is set for e2e tests (falls back to compose defaults)
+    if (!process.env.DATABASE_URL) {
+      process.env.DATABASE_URL = 'postgresql://quantum:quantum-dev-password@localhost:5432/quantumbilling';
+    }
     const moduleFixture: TestingModule = await Test.createTestingModule({
       imports: [AppModule],
     })

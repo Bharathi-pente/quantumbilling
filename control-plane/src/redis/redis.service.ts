@@ -18,26 +18,26 @@ export class RedisService implements OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    await this.client.quit();
+    try { await this.client.quit(); } catch {}
   }
 
   /** Write-through: set org existence key with 1h TTL */
   async setOrgExistence(orgId: string) {
-    try { await this.client.set(`org:${orgId}`, '1', 'EX', 3600); } catch {}
+    try { await this.client.set(`org:${orgId}`, '1', 'EX', 3600); } catch (e) { console.error('[Redis] setOrgExistence failed:', e); }
   }
 
   /** Write-through: delete org existence key */
   async delOrgExistence(orgId: string) {
-    try { await this.client.del(`org:${orgId}`); } catch {}
+    try { await this.client.del(`org:${orgId}`); } catch (e) { console.error('[Redis] delOrgExistence failed:', e); }
   }
 
   /** Write-through: set end-user existence key with 1h TTL */
   async setEndUserExistence(orgId: string, endUserId: string) {
-    try { await this.client.set(`org:${orgId}:enduser:${endUserId}`, '1', 'EX', 3600); } catch {}
+    try { await this.client.set(`org:${orgId}:enduser:${endUserId}`, '1', 'EX', 3600); } catch (e) { console.error('[Redis] setEndUserExistence failed:', e); }
   }
 
   /** Write-through: delete end-user existence key */
   async delEndUserExistence(orgId: string, endUserId: string) {
-    try { await this.client.del(`org:${orgId}:enduser:${endUserId}`); } catch {}
+    try { await this.client.del(`org:${orgId}:enduser:${endUserId}`); } catch (e) { console.error('[Redis] delEndUserExistence failed:', e); }
   }
 }

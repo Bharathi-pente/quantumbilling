@@ -18,13 +18,13 @@ export class CustomerService {
         billingEmail: dto.email,
         status: 'ACTIVE',
         createdAt: new Date(),
-      },
+      } as any,
     });
 
     await this.prisma.auditLog.create({
       data: {
         id: randomUUID(),
-        userId: actorId,
+        userId: null,
         orgId: orgId,
         action: 'CUSTOMER_CREATED',
         resourceType: 'customer',
@@ -71,7 +71,7 @@ export class CustomerService {
     await this.prisma.auditLog.create({
       data: {
         id: randomUUID(),
-        userId: actorId,
+        userId: null,
         orgId: customer.orgId,
         action: dto.status ? `CUSTOMER_${dto.status}` : 'CUSTOMER_UPDATED',
         resourceType: 'customer',

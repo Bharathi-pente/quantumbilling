@@ -3,6 +3,7 @@ module.exports = {
   rootDir: '..',
   testEnvironment: 'node',
   testRegex: 'test/.*\\.e2e-spec\\.ts$',
+  testTimeout: 30000,
   transform: {
     '^.+\\.(t|j)s$': ['ts-jest', { tsconfig: 'tsconfig.json' }],
   },

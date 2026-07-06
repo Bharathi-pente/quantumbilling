@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pente/quantumbilling/engine/internal/auth"
+	"github.com/pente/quantumbilling/engine/internal/kafka"
 	"github.com/pente/quantumbilling/engine/internal/models"
 	"github.com/pente/quantumbilling/engine/internal/postgres"
 	"github.com/redis/go-redis/v9"
@@ -21,14 +22,16 @@ import (
 
 // IngestHandler holds dependencies for the ingest endpoints.
 type IngestHandler struct {
-	Redis  *redis.Client
-	PG     *sql.DB
-	Log    *slog.Logger
+	Redis    *redis.Client
+	PG       *sql.DB
+	Log      *slog.Logger
+	Publish  kafka.PublishFunc
+	PubBatch kafka.BatchPublishFunc
 }
 
 // NewIngestHandler creates a handler with the given dependencies.
-func NewIngestHandler(rdb *redis.Client, pg *sql.DB, log *slog.Logger) *IngestHandler {
-	return &IngestHandler{Redis: rdb, PG: pg, Log: log}
+func NewIngestHandler(rdb *redis.Client, pg *sql.DB, log *slog.Logger, pub kafka.PublishFunc, pubBatch kafka.BatchPublishFunc) *IngestHandler {
+	return &IngestHandler{Redis: rdb, PG: pg, Log: log, Publish: pub, PubBatch: pubBatch}
 }
 
 // POST /v1/events — single event ingest (story_4)
@@ -79,7 +82,7 @@ func (h *IngestHandler) HandleSingleEvent(w http.ResponseWriter, r *http.Request
 	// Idempotency: SETNX idem:{org_id}:{event_id} (24h TTL) — story_4 AC 11-14
 	idemKey := fmt.Sprintf("idem:%s:%s", event.OrgID, event.EventID)
 	ttl := getEnvDuration("IDEMPOTENCY_TTL", models.DefaultIdempotencyTTL)
-	ok, err := h.Redis.SetNX(r.Context(), idemKey, "1", ttl).Result()
+	ok, err = h.Redis.SetNX(r.Context(), idemKey, "1", ttl).Result()
 	if err != nil {
 		h.Log.Error("idempotency check failed", "error", err)
 		writeError(w, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "idempotency service unavailable")
@@ -119,18 +122,17 @@ func (h *IngestHandler) HandleSingleEvent(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// TODO: Kafka publish (D-02 skeleton — async produce)
-	// For now, log and return 202
-	h.Log.Info("event accepted",
-		"event_id", event.EventID,
-		"org_id", event.OrgID,
-		"source_mode", event.SourceMode,
-		"model", event.Model,
-		"total_tokens", event.TotalTokens,
-	)
-
-	// Kafka publish placeholder — replace with real Kafka producer in D-02 completion
-	_ = msgBytes
+	// Publish to Kafka (async — 202 accepted)
+	if h.Publish != nil {
+		if err := h.Publish(r.Context(), msgBytes, event.OrgID); err != nil {
+			h.Log.Error("kafka publish failed", "error", err, "event_id", event.EventID)
+			// Event still accepted — Kafka producer handles retries internally.
+			// If the producer is permanently down, the health endpoint will reflect it.
+		}
+	} else {
+		h.Log.Warn("kafka producer not configured — event logged but not published",
+			"event_id", event.EventID)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
