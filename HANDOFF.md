@@ -164,3 +164,22 @@ px tsc-style review for syntax.
   - LiteLLM gateway key sync (D-06)
   - IV uniqueness test across 1000 ops
   - GCM tampered ciphertext test
+
+## D-06 — Track A: LiteLLM gateway integration (Milestone M1)
+- BASE_SHA / COMMIT_SHA: 7f072a8 / 083cf51
+- Summary: Integrated LiteLLM gateway with custom usage-event callback posting to Go ingest API, key provisioning sync to LiteLLM VerificationToken table, and updated proxy config with qb-echo/qb-mock models and success/failure callbacks.
+- Files changed: 3 files (proxy_server_config.yaml updated, custom_logger.py, key_sync.py)
+- Done-criteria evidence:
+  1. Proxy config: qb-echo + qb-mock models, custom_logger callbacks, router settings ?
+  2. CustomLogger: async_log_success/failure_handler ? POST /v1/events with key context metadata ?
+  3. Key sync: upsert/block VerificationToken on create/revoke via LiteLLM Postgres ?
+  4. Dead-letter: writes to /tmp/qb_dead_letter.jsonl on ingest outage, retry with backoff ?
+  5. Spoof protection: org_id/customer_id from key metadata, never from request ?
+- Deviations from prompt:
+  - BYOK pre-call hook (story_23) deferred — decrypt via keys-api internal endpoint not wired
+  - Budget/rate-limit sync (story_22) deferred — LiteLLM internal budget management used
+  - Gateway profile not enabled in compose (requires --profile gateway) — documented in README
+- Open items:
+  - Enable gateway profile and test end-to-end with mock provider
+  - Story_23 BYOK decryption hook
+  - Story_22 budget/rate-limit sync
