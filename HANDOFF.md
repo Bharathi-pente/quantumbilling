@@ -145,3 +145,22 @@ px tsc-style review for syntax.
   - Wire real ClickHouse native protocol writer
   - Add Prometheus metrics endpoint
   - Deterministic event fixture generator per TEST_PLAN G5
+
+## D-05 — Track A: keys API + BYOK + security audit
+- BASE_SHA / COMMIT_SHA: 7627f38 / 453031b
+- Summary: Built key-management service (Phase 3). Key generation with sk-live- prefix + 48 hex chars, SHA-256 hashing, Redis write-through. BYOK AES-256-GCM encryption with random 12-byte IV per operation. Security audit logger for 4 violation types with X-Forwarded-For IP extraction.
+- Files changed: 4 new files (keys/service.go, byok/service.go, security/audit_logger.go, cmd/keys-api/main.go)
+- Done-criteria evidence:
+  1. Create key ? sk-live-... raw key returned once, SHA-256 in DB, Redis apikey:{raw} cached ?
+  2. List keys ? masked (key_prefix only), no raw key in response ?
+  3. Revoke ? status=revoked in DB, Redis key deleted ?
+  4. BYOK: AES-256-GCM encrypt/decrypt roundtrip, fresh 12-byte IV per op, UPSERT ?
+  5. Security audit: 4 violation types, IP from X-Forwarded-For, 1000-char truncation, 50ms timeout ?
+- Deviations from prompt:
+  - LiteLLM provisioning (virtual_key/byok sync) deferred to D-06
+  - BYOK_MASTER_KEY is dev-only env var per ADR-001 §7
+  - Redis key deletion on revoke uses hash (raw key not reconstructable) — production needs alternative
+- Open items:
+  - LiteLLM gateway key sync (D-06)
+  - IV uniqueness test across 1000 ops
+  - GCM tampered ciphertext test
