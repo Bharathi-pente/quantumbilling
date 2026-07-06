@@ -1,5 +1,5 @@
 ## D-00 — Repo bootstrap & dev loop
-- BASE_SHA / COMMIT_SHA: (see git log — initial commit)
+- BASE_SHA / COMMIT_SHA: (empty repo, no prior commits) / 2778fad
 - Summary: Bootstrapped the QuantumBilling implementation monorepo per SCAFFOLD.md §1 layout. Created Go engine module, NestJS control-plane, Next.js web app, and gateway placeholder. Copied all verbatim artifacts from the vendored spec repo at docs/. Wrote ClickHouse migration runner, Redis warm-up script, CI pipeline (GitHub Actions), CODEOWNERS, verify-local.sh, regression-gates.sh, and README.md.
 - Files changed: ~45 files created (see git status)
 - Commands run:
