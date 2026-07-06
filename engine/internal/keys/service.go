@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,7 +25,7 @@ type KeyRequest struct {
 	CustomerID     string   `json:"customer_id,omitempty"`
 	EndUserID      string   `json:"end_user_id,omitempty"`
 	SourceMode     string   `json:"source_mode,omitempty"`
-	BudgetLimitUSD float64  `json:"budget_limit_usd,omitempty"`
+	BudgetLimitUSD string   `json:"budget_limit_usd,omitempty"` // decimal string per BILLING_MATH M-1
 	RateLimitRPM   int      `json:"rate_limit_rpm,omitempty"`
 	AllowedModels  []string `json:"allowed_models,omitempty"`
 }
@@ -38,7 +39,7 @@ type KeyResponse struct {
 	CustomerID  string   `json:"customer_id"`
 	SourceMode  string   `json:"source_mode"`
 	Status      string   `json:"status"`
-	BudgetLimit float64  `json:"budget_limit_usd,omitempty"`
+	BudgetLimit string   `json:"budget_limit_usd,omitempty"` // decimal string
 	RateLimit   int      `json:"rate_limit_rpm,omitempty"`
 	Models      []string `json:"allowed_models,omitempty"`
 }
@@ -82,9 +83,11 @@ func (s *Service) CreateKey(ctx context.Context, req KeyRequest) (*KeyResponse, 
 		return nil, fmt.Errorf("INVALID_KEY_NAME: must be 3-100 characters")
 	}
 
-	// Validate budget/rate limit
-	if req.BudgetLimitUSD < 0 {
-		return nil, fmt.Errorf("INVALID_BUDGET_LIMIT: must be non-negative")
+	// Validate budget as positive decimal string
+	if req.BudgetLimitUSD != "" {
+		if val, err := strconv.ParseFloat(req.BudgetLimitUSD, 64); err != nil || val < 0 {
+			return nil, fmt.Errorf("INVALID_BUDGET_LIMIT: must be a non-negative decimal string")
+		}
 	}
 	if req.RateLimitRPM < 0 {
 		return nil, fmt.Errorf("INVALID_RATE_LIMIT: must be non-negative")
