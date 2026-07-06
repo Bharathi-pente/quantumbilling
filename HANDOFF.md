@@ -197,3 +197,9 @@ px tsc-style review for syntax.
 - Files changed: 4 new files (bff module), app.module.ts updated, @nestjs/axios installed
 - Done: 13 proxy endpoints under /api/v1/usage/* mapping to analytics-api paths. Service token never reaches browser.
 - Session 2 (D-08 continued): web/ dashboards (5 pages) + Playwright e2e
+
+## D-08 — Track B: 5 dashboards (session 2) — Milestone M2
+- BASE_SHA / COMMIT_SHA: b14fc24 / 994c8f5
+- Summary: Completed D-08 with 5 role-gated dashboard pages using Recharts + Tailwind. All fetch via BFF proxy /api/v1/usage/*.
+- 5 pages: /dashboard (org overview + trend + table), /dashboard/team-usage (bar chart), /platform/analytics (SUPER_ADMIN), /my-usage (end-user cards), /my-usage/events (daily table)
+- Deviations: Playwright e2e tests not yet added. CSV export deferred to D-19.
