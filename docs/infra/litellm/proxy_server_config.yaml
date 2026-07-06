@@ -1,0 +1,12 @@
+# QuantumBilling LiteLLM development stub.
+# D-06 replaces/extends this with model routing, callbacks, and hooks.
+model_list:
+  - model_name: qb-echo
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+litellm_settings:
+  drop_params: true
+  set_verbose: false
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

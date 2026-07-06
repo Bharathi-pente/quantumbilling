@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment
+.env
+!.env.example
+
+# Build output
+dist/
+.next/
+out/
+
+# Go
+engine/coverage-engine.out
+*.exe
+*.test
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+data/
+
+# Prisma
+control-plane/prisma/migrations/

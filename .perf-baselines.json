@@ -1,0 +1,5 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Performance baselines per TEST_PLAN G3 — populated by dispatch units as perf criteria are measured. CI perf job asserts subsequent runs stay within tolerance.",
+  "metrics": {}
+}

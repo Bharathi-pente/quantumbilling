@@ -1,0 +1,8 @@
+# QuantumBilling CODEOWNERS
+#
+# Per SCAFFOLD.md §2: the Go billing worker owners must review billing.*
+# Prisma schema changes (the one-writer rule: Prisma owns all DDL, Go owns
+# financial DML, so schema changes that affect billing tables need both eyes).
+
+# Engine team reviews billing-related Prisma models
+control-plane/prisma/schema.prisma @pente/engine-team

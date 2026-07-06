@@ -1,0 +1,1354 @@
+openapi: 3.1.0
+info:
+  title: QuantumBilling Event Engine API
+  version: 0.1.0
+  description: |
+    Operational surface of the Go event engine: usage-event ingestion (single and
+    batch), real-time entitlement enforcement, prepaid wallet (CR-2), and API key
+    management.
+
+    This specification is derived from the story documents and ADR-001
+    (`ARCHITECTURE_DECISION.md`, 2026-07-01):
+
+    - Ingestion: `backend/phase_0_event_ingestion_pipeline.md`,
+      `backend/story_4_single_event_ingest.md`, `backend/story_5_batch_event_ingest.md`
+    - Enforcement + wallet: `backend/phase_2_billing_worker.md`,
+      `backend/story_25_wallet_and_auto_topup.md`
+    - Keys: `backend/story_11_key_generation_and_storage.md`,
+      `backend/story_12_key_revocation_and_listing.md`
+
+    Entity vocabulary follows ADR-001 §2.1: `org_id` → `customer_id` → `end_user_id`
+    (the backend stories' `tenant_id`/`user_id` are renamed).
+
+    **Authentication.** Ingest and key-management endpoints authenticate with an
+    org/virtual/BYOK API key in `X-API-Key`. Enforcement and wallet endpoints are
+    not exposed for direct external access: they accept service-to-service calls
+    from the NestJS BFF (or the LiteLLM gateway) carrying a BFF-signed JWT in
+    `X-QB-Service-Token`, with the resolved end-user scope forwarded in the trusted
+    headers `X-QB-Org-Id`, `X-QB-Customer-Id`, and `X-QB-Role` (required on scoped
+    endpoints). The engine treats those headers as the authenticated context.
+
+    All monetary values are decimal strings (e.g. `"0.045000"`) to avoid binary
+    floating-point precision loss.
+tags:
+  - name: Events
+    description: Usage-event ingestion (Phase 0). Events are validated, deduplicated (org-scoped idempotency on `event_id`, 24h TTL), and published to Kafka `usage-events`. 202 means accepted for processing, not yet committed to ClickHouse.
+  - name: Entitlements
+    description: Sub-5ms enforcement hot path (Phase 2). Called by the gateway before forwarding a request.
+  - name: Wallet
+    description: Prepaid wallet with burndown and auto top-up (CR-2, Story 25). Redis is the enforcement cache; Postgres `billing.wallet_transactions` is the system of record. Config fields are written by the control plane (one-writer rule); balance and transactions by the billing worker.
+  - name: Keys
+    description: API key lifecycle (Phase 3, Stories 11-12). Raw keys are returned exactly once at creation and never stored; only the SHA-256 hash and the `key_prefix` (first 11 chars) are persisted.
+servers:
+  - url: "{scheme}://{host}"
+    variables:
+      scheme:
+        default: https
+      host:
+        default: event-engine.internal:8011
+
+security: []
+
+paths:
+  /v1/events:
+    post:
+      operationId: ingestEvent
+      tags: [Events]
+      summary: Ingest a single usage event
+      description: |
+        Accepts one `UsageEvent`, authenticates the caller via `X-API-Key`,
+        enriches the event from the key context (`org_id`, `customer_id`,
+        `source_mode`, `key_id` are set/overridden server-side — spoofed IDs in the
+        payload are ignored for virtual-key/BYOK modes), generates `event_id` and
+        `timestamp_ms` when absent, validates, deduplicates via Redis
+        `SETNX idem:{org_id}:{event_id}` (TTL 24h), verifies org and end-user
+        existence, and publishes to Kafka topic `usage-events` (partition key
+        `org_id`).
+
+        Request body is limited to 1MB (`413 PAYLOAD_TOO_LARGE`). Unknown JSON
+        fields are ignored for forward compatibility. The response carries the
+        request trace ID in `X-Request-ID`.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UsageEvent"
+            example:
+              event_id: "evt_01J8Z0YQK9"
+              org_id: "org_acme"
+              customer_id: "customer_1"
+              end_user_id: "user_joe"
+              session_id: "sess_abc"
+              event_type: "llm_request"
+              model: "gpt-4"
+              input_tokens: 900
+              output_tokens: 600
+              thinking_tokens: 0
+              total_tokens: 1500
+              unit: "tokens"
+              latency: "234ms"
+              cost: "0.045000"
+              status: "success"
+              service: "chat"
+              timestamp_ms: 1751328000000
+              metadata:
+                region: "us-east-1"
+      responses:
+        "202":
+          description: Event accepted for processing (published to Kafka; ClickHouse commit is asynchronous).
+          headers:
+            X-Request-ID:
+              description: Trace ID of the request (OpenTelemetry span) for client-side correlation.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestAccepted"
+              example:
+                accepted: true
+                event_id: "evt_01J8Z0YQK9"
+                message: "event accepted for processing"
+        "400":
+          description: "Validation failed (`BAD_REQUEST`, names the offending field) or invalid JSON body (`INVALID_JSON`)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: "Org unknown (`UNKNOWN_ORG`) or end user not a member of the authenticated org (`USER_NOT_IN_ORG`)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "`DUPLICATE_EVENT` — this `event_id` was already processed for this org (idempotency window 24h). The duplicate `event_id` is echoed in `error.details`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: "DUPLICATE_EVENT"
+                  message: "event already processed"
+                  details:
+                    event_id: "evt_01J8Z0YQK9"
+        "413":
+          description: "`PAYLOAD_TOO_LARGE` — body exceeds 1MB."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/events/batch:
+    post:
+      operationId: ingestEventBatch
+      tags: [Events]
+      summary: Ingest a batch of usage events (max 50,000)
+      description: |
+        Optimized bulk ingest: up to 50,000 events per request (500MB body cap),
+        sustaining 500k events/s across concurrent requests. Accepts either the
+        wrapped form `{"events":[...]}` or a bare array `[...]`.
+
+        **Partial accept is the expected behavior**: valid events are published
+        even when others in the batch fail. The 202 response reports
+        `accepted_count`/`failed_count` (their sum always equals the input count)
+        plus a per-index `errors` array identifying each rejected event and why
+        (`DUPLICATE_EVENT`, `UNKNOWN_ORG`, `USER_NOT_IN_ORG`, validation). Dedup
+        uses a sharded Redis Bloom filter with `SETNX` fallback; org and end-user
+        existence are resolved with batched Redis/Postgres lookups.
+
+        If every event fails, the endpoint returns `400 NO_VALID_EVENTS`. If the
+        event count exceeds `MAX_BATCH_SIZE` (default 50,000), the endpoint
+        returns `413 BATCH_TOO_LARGE` with the current maximum in the message.
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [events]
+                  properties:
+                    events:
+                      type: array
+                      items:
+                        $ref: "#/components/schemas/UsageEvent"
+                      minItems: 1
+                      maxItems: 50000
+                - type: array
+                  items:
+                    $ref: "#/components/schemas/UsageEvent"
+                  minItems: 1
+                  maxItems: 50000
+      responses:
+        "202":
+          description: Batch processed; valid events published to Kafka. Partial failures are itemized per index.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchIngestResult"
+              example:
+                accepted: true
+                accepted_count: 9700
+                failed_count: 300
+                message: "batch processed"
+                errors:
+                  - index: 42
+                    event_id: "evt_dup_001"
+                    code: "DUPLICATE_EVENT"
+                    message: "event already processed"
+                  - index: 118
+                    event_id: "evt_01J8Z1AAA1"
+                    code: "UNKNOWN_ORG"
+                    message: "org org_ghost not found"
+        "400":
+          description: "`INVALID_JSON` — body is neither `{\"events\":[...]}` nor a bare array; or `NO_VALID_EVENTS` — empty batch or every event was filtered out (`failed_count = input count`)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: "`BATCH_TOO_LARGE` — event count exceeds `MAX_BATCH_SIZE` (default 50,000); or `PAYLOAD_TOO_LARGE` — body exceeds 500MB."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: "BATCH_TOO_LARGE"
+                  message: "batch of 60000 events exceeds the maximum of 50000"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/entitlements/check:
+    get:
+      operationId: checkEntitlement
+      tags: [Entitlements]
+      summary: Real-time usage-limit and wallet enforcement check
+      description: |
+        Hot-path endpoint (< 5ms; Redis only, no Postgres/ClickHouse) called by
+        the API gateway before forwarding a request. Evaluates the current Redis
+        usage/spend counters against the customer's SOFT/HARD limits
+        (`customer.usage_limits`, with `customer.limit_overrides` taking
+        precedence) and, for wallet customers, the prepaid balance
+        `wallet:{customer_id}`.
+
+        **Semantics:**
+        - Below SOFT limit → `200 {"allowed": true}`.
+        - At/above SOFT but below HARD → `200 {"allowed": true}` **with the
+          `X-QB-Usage-Warning: approaching limit` response header** and
+          `warning: true` in the body.
+        - At/above HARD limit → `429 {"allowed": false, "reason": "usage_limit_exceeded"}`.
+        - Wallet balance + grace exhausted → `429 {"allowed": false, "reason": "wallet_exhausted"}`
+          — unless the customer's contract permits postpaid overflow, in which case
+          `200` is returned with the `X-QB-Wallet-Overflow: true` header and
+          subsequent usage is rated onto the next postpaid invoice.
+
+        A `429` means the gateway must block the request; enforcement is checked
+        before forwarding, so a blocked request never partially decrements the
+        wallet.
+      security:
+        - ServiceToken: []
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - name: org_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: customer_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: end_user_id
+          in: query
+          required: false
+          description: Optional end-user scope for per-user counters.
+          schema:
+            type: string
+        - name: meter
+          in: query
+          required: false
+          description: Meter/feature to check (per-meter limits in `customer.usage_limits`). Omit to check the customer's aggregate token/spend limits.
+          schema:
+            type: string
+        - name: estimated_tokens
+          in: query
+          required: false
+          description: Estimated token count of the pending request; added to current usage when comparing against limits.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: Request allowed (possibly with a soft-limit warning or wallet-overflow indication).
+          headers:
+            X-QB-Usage-Warning:
+              description: Present with value `approaching limit` when current + estimated usage is at/above the SOFT limit but below the HARD limit.
+              schema:
+                type: string
+            X-QB-Wallet-Overflow:
+              description: Present with value `true` when the prepaid wallet is exhausted but contract terms permit postpaid overflow (usage bills to the next invoice).
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntitlementCheckResponse"
+              example:
+                allowed: true
+                warning: true
+                reason: null
+                limit:
+                  limit_type: "SOFT"
+                  limit_value: 1000000
+                  current_usage: 812000
+                  estimated_tokens: 1500
+                  remaining: 186500
+                wallet:
+                  balance: "19.250000"
+                  grace_amount: "0.000000"
+                  exhausted: false
+                  overflow_to_invoice: false
+        "400":
+          description: Missing/invalid query parameters.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          description: |
+            Request must be blocked. `reason` is `usage_limit_exceeded` (HARD limit
+            reached) or `wallet_exhausted` (prepaid balance + grace ≤ 0 with no
+            postpaid overflow terms). Also returned platform-wide for customers
+            suspended by dunning.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EntitlementCheckResponse"
+              example:
+                allowed: false
+                warning: false
+                reason: "wallet_exhausted"
+                limit: null
+                wallet:
+                  balance: "0.000000"
+                  grace_amount: "0.000000"
+                  exhausted: true
+                  overflow_to_invoice: false
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /v1/customers/{customer_id}/wallet:
+    parameters:
+      - $ref: "#/components/parameters/CustomerIdPath"
+      - $ref: "#/components/parameters/XQBOrgId"
+      - $ref: "#/components/parameters/XQBCustomerId"
+      - $ref: "#/components/parameters/XQBRole"
+    get:
+      operationId: getWallet
+      tags: [Wallet]
+      summary: Get wallet balance, status, and top-up configuration
+      description: |
+        Returns the customer's prepaid wallet: balance (system-of-record value
+        from `billing.wallets`, reconciled nightly against the Redis enforcement
+        cache), status, low-balance state, and auto top-up configuration
+        (Story 25).
+      security:
+        - ServiceToken: []
+      responses:
+        "200":
+          description: Wallet state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wallet"
+              example:
+                customer_id: "customer_1"
+                balance: "59.000000"
+                currency: "USD"
+                status: "active"
+                low_balance_threshold: "10.000000"
+                low_balance: false
+                auto_topup_enabled: true
+                topup_amount: "50.000000"
+                topup_payment_method_id: "pm_1NxyzStripe"
+                grace_amount: "0.000000"
+                updated_at: "2026-07-01T02:00:00Z"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: "`WALLET_NOT_FOUND` — the customer has no wallet row (postpaid-only customer)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    patch:
+      operationId: updateWalletConfig
+      tags: [Wallet]
+      summary: Update wallet top-up configuration
+      description: |
+        Updates wallet **configuration** fields only: `low_balance_threshold`,
+        `auto_topup_enabled`, `topup_amount`, `topup_payment_method_id`, `status`.
+        Per the one-writer rule (ADR-001 §2) this is a proxied write via the
+        control plane — the billing worker never writes config fields, and this
+        endpoint never modifies `balance` (balance moves only through top-ups,
+        burndown, and adjustments recorded in the transaction ledger).
+      security:
+        - ServiceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WalletConfigUpdate"
+      responses:
+        "200":
+          description: Updated wallet configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Wallet"
+        "400":
+          description: Invalid configuration values.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: "`WALLET_NOT_FOUND`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/customers/{customer_id}/wallet/topup:
+    post:
+      operationId: topUpWallet
+      tags: [Wallet]
+      summary: Manual wallet top-up via Stripe PaymentIntent
+      description: |
+        Creates a Stripe PaymentIntent for the requested amount on the requested
+        (or default) saved payment method. On success the balance is incremented,
+        a `topup` transaction row is appended with the linked `payment_id`, a
+        receipt is issued, and the new balance is pushed over the
+        `updates:{org_id}` Pub/Sub channel. On payment failure the wallet stays
+        at its real balance and the failure feeds the dunning pipeline (CR-6).
+
+        Amounts ≤ 0 are rejected with `400 INVALID_TOPUP_AMOUNT`; wallets whose
+        status is not `active` are rejected with `409 WALLET_NOT_ACTIVE`.
+      security:
+        - ServiceToken: []
+      parameters:
+        - $ref: "#/components/parameters/CustomerIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TopUpRequest"
+            example:
+              amount: "25.000000"
+              payment_method_id: "pm_1NxyzStripe"
+      responses:
+        "202":
+          description: PaymentIntent created; result of the charge is reported in `payment_status` (a synchronous decline is also reported here, with the failure routed to dunning).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TopUpResult"
+              example:
+                customer_id: "customer_1"
+                amount: "25.000000"
+                payment_status: "succeeded"
+                payment_id: "pay_01J8Z2QQ01"
+                balance_after: "84.000000"
+                transaction_id: "wtx_01J8Z2QQ77"
+        "400":
+          description: "`INVALID_TOPUP_AMOUNT` — amount must be > 0."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: "`WALLET_NOT_FOUND`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "`WALLET_NOT_ACTIVE` — wallet status is `frozen` or `closed`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/customers/{customer_id}/wallet/transactions:
+    get:
+      operationId: listWalletTransactions
+      tags: [Wallet]
+      summary: Paginated wallet transaction history
+      description: |
+        Append-only ledger of every balance movement from
+        `billing.wallet_transactions` (the wallet's system of record), filterable
+        by `type` and date range. Types: `topup`, `auto_topup`, `burndown`
+        (batched by aggregation window, `period_ref`), `refund`, `adjustment`
+        (includes recurring-grant applications/expiries, CR-14).
+      security:
+        - ServiceToken: []
+      parameters:
+        - $ref: "#/components/parameters/CustomerIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - name: type
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/WalletTransactionType"
+        - name: from
+          in: query
+          required: false
+          description: Start of the date range (inclusive), `YYYY-MM-DD`.
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: false
+          description: End of the date range (inclusive), `YYYY-MM-DD`.
+          schema:
+            type: string
+            format: date
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Transaction page, newest first. An empty history returns `200` with an empty array, never `404`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WalletTransactionList"
+              example:
+                customer_id: "customer_1"
+                transactions:
+                  - id: "wtx_01J8Z2QQ77"
+                    type: "auto_topup"
+                    amount: "50.000000"
+                    balance_after: "59.000000"
+                    payment_id: "pay_01J8Z2QQ01"
+                    period_ref: null
+                    description: "auto top-up on low-balance threshold"
+                    created_at: "2026-06-30T18:04:11Z"
+                  - id: "wtx_01J8Z2P123"
+                    type: "burndown"
+                    amount: "-3.000000"
+                    balance_after: "9.000000"
+                    payment_id: null
+                    period_ref: "2026-06-30T18:00"
+                    description: "usage burndown (batched)"
+                    created_at: "2026-06-30T18:00:30Z"
+                pagination:
+                  limit: 100
+                  offset: 0
+                  total: 2
+        "400":
+          description: "Invalid pagination, filter, or date range (`INVALID_PAGINATION`, `INVALID_DATE_FORMAT`, `INVALID_DATE_RANGE`)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: "`WALLET_NOT_FOUND`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /v1/keys:
+    post:
+      operationId: createKey
+      tags: [Keys]
+      summary: Create an API key
+      description: |
+        Generates a new API key for an organization (Story 11). For
+        `virtual_key`/`byok` modes the key is provisioned in the LiteLLM gateway
+        first, falling back to local secure random generation on gateway
+        failure/timeout (indicated by `litellm_fallback: true`). Keys use the
+        `sk-live-` prefix followed by 48 hex characters; only the SHA-256 hash and
+        the 11-character `key_prefix` are stored, and the key context is
+        write-through cached in Redis so the key authenticates immediately.
+
+        **The raw key is returned exactly once in this response and can never be
+        retrieved again.**
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApiKeyCreateRequest"
+            example:
+              org_id: "org_acme"
+              customer_id: "customer_1"
+              name: "Acme Web Customer Key"
+              source_mode: "virtual_key"
+              budget_limit_usd: "100.00"
+              rate_limit_rpm: 500
+              allowed_models: ["gpt-4", "claude-3-opus"]
+      responses:
+        "201":
+          description: Key created. `key` contains the raw unhashed secret — shown once, never persisted or logged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyCreated"
+              example:
+                id: "b7f3d0a2-4c1e-4f4a-9a70-2f9b1c6d8e01"
+                key: "sk-live-3f9a1c...48hex...b2"
+                key_prefix: "sk-live-3f9"
+                org_id: "org_acme"
+                customer_id: "customer_1"
+                name: "Acme Web Customer Key"
+                source_mode: "virtual_key"
+                status: "active"
+                budget_limit_usd: "100.00"
+                rate_limit_rpm: 500
+                allowed_models: ["gpt-4", "claude-3-opus"]
+                litellm_fallback: false
+                created_at: "2026-07-01T09:30:00Z"
+        "400":
+          description: "Validation failure: missing `org_id`/`name`, `INVALID_SOURCE_MODE`, `INVALID_KEY_NAME`, `INVALID_BUDGET_LIMIT`, `INVALID_RATE_LIMIT`, `INVALID_ALLOWED_MODELS`, or `INVALID_CUSTOMER_ID` (customer not found or inactive under the org)."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error:
+                  code: "INVALID_CUSTOMER_ID"
+                  message: "customer customer_nonexistent not found or inactive under org_acme"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    get:
+      operationId: listKeys
+      tags: [Keys]
+      summary: List API keys for an organization
+      description: |
+        Lists key metadata for the given `org_id`, sorted by `created_at`
+        descending (Story 12). The response never includes the raw key or its
+        SHA-256 hash — only `key_prefix` is exposed for identification. An empty
+        result returns `200` with an empty array, never `null`.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: org_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: status
+          in: query
+          required: false
+          description: "Filter by key status. Unsupported values return `400 INVALID_STATUS_FILTER`."
+          schema:
+            type: string
+            enum: [active, revoked]
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 500
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Key list page.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiKeyList"
+              example:
+                keys:
+                  - id: "b7f3d0a2-4c1e-4f4a-9a70-2f9b1c6d8e01"
+                    name: "Acme Web Customer Key"
+                    key_prefix: "sk-live-3f9"
+                    source_mode: "virtual_key"
+                    status: "active"
+                    budget_limit_usd: "100.00"
+                    rate_limit_rpm: 500
+                    created_at: "2026-07-01T09:30:00Z"
+                    revoked_at: null
+                pagination:
+                  limit: 100
+                  offset: 0
+                  total: 1
+        "400":
+          description: "Missing `org_id`, `INVALID_PAGINATION`, or `INVALID_STATUS_FILTER`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/keys/{key_id}:
+    delete:
+      operationId: revokeKey
+      tags: [Keys]
+      summary: Revoke an API key
+      description: |
+        Marks the key `revoked` in Postgres (setting `revoked_at`) and
+        synchronously evicts `apikey:{hash}` from Redis so subsequent
+        authentication attempts fail instantly with `401`; active
+        WebSocket/SSE connections authenticated with the key are terminated
+        (Story 12). Revocation is **idempotent**: revoking an already-revoked key
+        returns `200` without any database write.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: key_id
+          in: path
+          required: true
+          description: Key UUID. Invalid UUID formats return `400`.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Key revoked (or was already revoked).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, status]
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    const: revoked
+                  revoked_at:
+                    type: string
+                    format: date-time
+              example:
+                id: "b7f3d0a2-4c1e-4f4a-9a70-2f9b1c6d8e01"
+                status: "revoked"
+                revoked_at: "2026-07-01T10:15:00Z"
+        "400":
+          description: Invalid UUID path format.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: "`KEY_NOT_FOUND` — no key with this ID exists."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        Org API key (`sk_org_...`), virtual key, or BYOK key (`sk-live-...`).
+        Auth middleware resolves the key's `KeyContext` from Redis
+        (`apikey:{sha256}`); revoked/expired keys are rejected with `401`
+        (`KEY_REVOKED`/`KEY_EXPIRED`). Used by ingest and key-management
+        endpoints.
+    ServiceToken:
+      type: apiKey
+      in: header
+      name: X-QB-Service-Token
+      description: |
+        BFF-signed JWT for service-to-service calls (ADR-001 §2, Phase 4
+        Authentication model). Issued by the NestJS BFF (or the gateway) after it
+        validates the end user's Keycloak JWT. Requests carrying this token must
+        also carry the trusted scope headers `X-QB-Org-Id`, `X-QB-Customer-Id`,
+        and `X-QB-Role`, which the engine treats as the authenticated context for
+        multi-tenant scope enforcement.
+
+  parameters:
+    CustomerIdPath:
+      name: customer_id
+      in: path
+      required: true
+      description: Canonical customer ID (`customer.customers.id`, ADR-001 §2.1).
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 100
+        minimum: 1
+        maximum: 1000
+    Offset:
+      name: offset
+      in: query
+      required: false
+      schema:
+        type: integer
+        default: 0
+        minimum: 0
+    XQBOrgId:
+      name: X-QB-Org-Id
+      in: header
+      required: true
+      description: Trusted scope header set by the NestJS BFF — the caller's resolved organization ID. Required on all ServiceToken-scoped endpoints.
+      schema:
+        type: string
+    XQBCustomerId:
+      name: X-QB-Customer-Id
+      in: header
+      required: false
+      description: Trusted scope header set by the NestJS BFF — the caller's resolved customer ID (present for Customer User scope; absent for org managers and platform admins).
+      schema:
+        type: string
+    XQBRole:
+      name: X-QB-Role
+      in: header
+      required: true
+      description: Trusted scope header set by the NestJS BFF — resolved RBAC role.
+      schema:
+        type: string
+        enum: [platform_admin, org_manager, customer_user]
+
+  responses:
+    Unauthorized:
+      description: "Missing/invalid credentials (`UNAUTHORIZED`), or the key is revoked (`KEY_REVOKED`) or expired (`KEY_EXPIRED`)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: "`UNAUTHORIZED_ACCESS` — the trusted scope headers do not permit access to this org/customer."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: "`UNSUPPORTED_MEDIA_TYPE` — `Content-Type` must be `application/json`."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: "`KAFKA_PUBLISH_FAILED` (broker unreachable/write error) or `AUTH_SERVICE_UNAVAILABLE` (Redis unreachable)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      description: Standard error envelope shared across the platform.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                Machine-readable error code from the story docs, e.g.
+                `UNAUTHORIZED`, `KEY_REVOKED`, `KEY_EXPIRED`, `UNKNOWN_ORG`,
+                `USER_NOT_IN_ORG`, `BAD_REQUEST`, `INVALID_JSON`,
+                `UNSUPPORTED_MEDIA_TYPE`, `PAYLOAD_TOO_LARGE`, `DUPLICATE_EVENT`,
+                `NO_VALID_EVENTS`, `BATCH_TOO_LARGE`, `KAFKA_PUBLISH_FAILED`,
+                `AUTH_SERVICE_UNAVAILABLE`, `INVALID_SOURCE_MODE`,
+                `INVALID_KEY_NAME`, `INVALID_BUDGET_LIMIT`, `INVALID_RATE_LIMIT`,
+                `INVALID_ALLOWED_MODELS`, `INVALID_CUSTOMER_ID`,
+                `INVALID_PAGINATION`, `INVALID_STATUS_FILTER`, `KEY_NOT_FOUND`,
+                `INVALID_TOPUP_AMOUNT`, `WALLET_NOT_ACTIVE`, `WALLET_NOT_FOUND`,
+                `UNAUTHORIZED_ACCESS`.
+            message:
+              type: string
+              description: Human-readable description of the failure.
+            details:
+              type: object
+              description: Optional structured context (e.g. the offending field, the duplicate `event_id`, the current batch maximum).
+              additionalProperties: true
+
+    Money:
+      type: string
+      description: Decimal amount serialized as a string (e.g. `"0.045000"`) to avoid binary floating-point precision loss. Default currency is USD.
+      examples: ["0.045000"]
+
+    SourceMode:
+      type: string
+      description: "Operational mode that produced/authorizes the event: direct SDK ingest, LiteLLM virtual-key proxy, or BYOK routing."
+      enum: [direct_ingest, virtual_key, byok]
+
+    UsageEvent:
+      type: object
+      description: |
+        Canonical AI usage telemetry event (Story 1, fields renamed per ADR-001
+        §2.1: `customer_id`/`end_user_id`). Server-side enrichment overrides
+        `org_id`, `customer_id`, `source_mode`, and `key_id` from the
+        authenticated key context; `event_id` (UUID v4) and `timestamp_ms` are
+        generated when absent. Unknown fields are ignored.
+      required: [event_type]
+      properties:
+        event_id:
+          type: string
+          description: Unique per event within an org (idempotency scope). Generated (UUID v4) if empty.
+        org_id:
+          type: string
+          description: Organization ID. Required for `direct_ingest`; overridden from key context for `virtual_key`/`byok`.
+        customer_id:
+          type: string
+          description: Canonical customer ID (`customer.customers.id`). May be empty when derivable from key context.
+        end_user_id:
+          type: string
+          description: End user (`customer.end_users.id`) or service account that triggered the event.
+        session_id:
+          type: string
+          description: Groups multiple requests in the same conversation.
+        source_mode:
+          $ref: "#/components/schemas/SourceMode"
+        key_id:
+          type: string
+          description: API key identifier used to authenticate this request (set server-side).
+        event_type:
+          type: string
+          description: e.g. `llm_request`, `embedding`, `image_generation`. Must be non-empty.
+        model:
+          type: string
+          description: Model name, e.g. `gpt-4`, `claude-3-opus`.
+        input_tokens:
+          type: integer
+          minimum: 0
+          description: Prompt token count (0 allowed for non-token events).
+        output_tokens:
+          type: integer
+          minimum: 0
+          description: Completion token count.
+        thinking_tokens:
+          type: integer
+          minimum: 0
+          description: Reasoning tokens from providers that separate them (Claude, Gemini).
+        total_tokens:
+          type: number
+          description: Sum of input + output (or provider-reported total).
+        unit:
+          type: string
+          description: Billing unit, e.g. `tokens`, `images`, `requests`.
+        latency:
+          type: string
+          description: Human-readable latency, e.g. `234ms`.
+        cost:
+          $ref: "#/components/schemas/Money"
+          description: Provider cost as a decimal string (COGS input for margin analytics, CR-11).
+        status:
+          type: string
+          enum: [success, error, rate_limited]
+        service:
+          type: string
+          description: Logical service name, e.g. `chat`, `completion`. Also carries the upstream provider for service analytics (`openai`, `anthropic`, ...).
+        timestamp_ms:
+          type: integer
+          format: int64
+          description: Epoch milliseconds when the call happened (decides billing-period membership). Server-generated if zero.
+        metadata:
+          type: object
+          description: Flat string-to-string map only — no nested objects.
+          additionalProperties:
+            type: string
+
+    IngestAccepted:
+      type: object
+      required: [accepted, event_id, message]
+      properties:
+        accepted:
+          type: boolean
+          const: true
+        event_id:
+          type: string
+          description: The event's ID (server-generated if not supplied).
+        message:
+          type: string
+
+    BatchIngestResult:
+      type: object
+      description: Partial-accept summary. `accepted_count + failed_count` always equals the input event count.
+      required: [accepted, accepted_count, failed_count, message]
+      properties:
+        accepted:
+          type: boolean
+          description: True whenever at least one event was published.
+        accepted_count:
+          type: integer
+          description: Number of events published to Kafka.
+        failed_count:
+          type: integer
+          description: Number of events filtered out (duplicates + unknown org + end user not in org + validation failures).
+        message:
+          type: string
+        errors:
+          type: array
+          description: Per-index failure detail for every rejected event, in input order.
+          items:
+            $ref: "#/components/schemas/BatchItemError"
+
+    BatchItemError:
+      type: object
+      required: [index, code, message]
+      properties:
+        index:
+          type: integer
+          minimum: 0
+          description: Zero-based position of the failed event in the submitted batch.
+        event_id:
+          type: string
+          description: The event's ID after enrichment (if one was assigned/supplied).
+        code:
+          type: string
+          description: "Per-event failure code: `DUPLICATE_EVENT`, `UNKNOWN_ORG`, `USER_NOT_IN_ORG`, or `BAD_REQUEST` (validation)."
+        message:
+          type: string
+
+    EntitlementCheckResponse:
+      type: object
+      required: [allowed]
+      properties:
+        allowed:
+          type: boolean
+        warning:
+          type: boolean
+          description: True when current + estimated usage is at/above the SOFT limit but below the HARD limit (mirrors the `X-QB-Usage-Warning` header).
+        reason:
+          type: ["string", "null"]
+          enum: [usage_limit_exceeded, wallet_exhausted, null]
+          description: Set only when `allowed` is false.
+        limit:
+          oneOf:
+            - $ref: "#/components/schemas/LimitState"
+            - type: "null"
+        wallet:
+          oneOf:
+            - $ref: "#/components/schemas/WalletState"
+            - type: "null"
+          description: Present only for customers with a wallet.
+
+    LimitState:
+      type: object
+      description: State of the governing usage limit (customer overrides take precedence over plan-level limits).
+      properties:
+        limit_type:
+          type: string
+          enum: [SOFT, HARD]
+          description: The limit tier currently governing the decision.
+        limit_value:
+          type: number
+          description: Configured limit (tokens or meter units for the checked meter/period).
+        current_usage:
+          type: number
+          description: Current Redis counter value for the checked scope.
+        estimated_tokens:
+          type: integer
+          description: Estimate supplied by the caller and included in the comparison.
+        remaining:
+          type: number
+          description: Headroom before the HARD limit.
+
+    WalletState:
+      type: object
+      description: Wallet enforcement snapshot (Redis cache value).
+      properties:
+        balance:
+          $ref: "#/components/schemas/Money"
+        grace_amount:
+          $ref: "#/components/schemas/Money"
+          description: Negative balance allowed before hard block (`WALLET_GRACE_AMOUNT`, per-wallet override possible).
+        exhausted:
+          type: boolean
+          description: True when balance + grace ≤ 0.
+        overflow_to_invoice:
+          type: boolean
+          description: True when contract terms permit postpaid overflow after wallet exhaustion (mirrors `X-QB-Wallet-Overflow`).
+
+    Wallet:
+      type: object
+      required: [customer_id, balance, currency, status]
+      properties:
+        customer_id:
+          type: string
+        balance:
+          $ref: "#/components/schemas/Money"
+          description: System-of-record balance from `billing.wallets` (ledger-reconciled nightly).
+        currency:
+          type: string
+          default: USD
+        status:
+          type: string
+          enum: [active, frozen, closed]
+        low_balance_threshold:
+          $ref: "#/components/schemas/Money"
+        low_balance:
+          type: boolean
+          description: True when balance is at/below `low_balance_threshold`.
+        auto_topup_enabled:
+          type: boolean
+        topup_amount:
+          $ref: "#/components/schemas/Money"
+          description: Amount charged per auto top-up when the low-balance threshold is crossed.
+        topup_payment_method_id:
+          type: ["string", "null"]
+          description: Saved Stripe payment method used for top-ups.
+        grace_amount:
+          $ref: "#/components/schemas/Money"
+          description: Per-wallet override of the deployment grace amount, if set.
+        updated_at:
+          type: string
+          format: date-time
+
+    WalletConfigUpdate:
+      type: object
+      description: Configuration fields only — all optional; at least one must be present. `balance` is never writable here.
+      minProperties: 1
+      properties:
+        low_balance_threshold:
+          $ref: "#/components/schemas/Money"
+        auto_topup_enabled:
+          type: boolean
+        topup_amount:
+          $ref: "#/components/schemas/Money"
+        topup_payment_method_id:
+          type: string
+        status:
+          type: string
+          enum: [active, frozen, closed]
+
+    TopUpRequest:
+      type: object
+      required: [amount]
+      properties:
+        amount:
+          $ref: "#/components/schemas/Money"
+          description: Amount to charge; must be > 0 (`400 INVALID_TOPUP_AMOUNT` otherwise).
+        payment_method_id:
+          type: string
+          description: Stripe payment method to charge; defaults to the wallet's configured/default method.
+
+    TopUpResult:
+      type: object
+      required: [customer_id, amount, payment_status]
+      properties:
+        customer_id:
+          type: string
+        amount:
+          $ref: "#/components/schemas/Money"
+        payment_status:
+          type: string
+          enum: [succeeded, pending, failed]
+          description: Outcome of the Stripe PaymentIntent. `failed` charges feed the dunning pipeline (CR-6); the balance is unchanged.
+        payment_id:
+          type: ["string", "null"]
+          description: "`billing.payments` record ID."
+        balance_after:
+          oneOf:
+            - $ref: "#/components/schemas/Money"
+            - type: "null"
+          description: New balance after a successful top-up.
+        transaction_id:
+          type: ["string", "null"]
+          description: Appended `billing.wallet_transactions` row ID (type `topup`).
+
+    WalletTransactionType:
+      type: string
+      enum: [topup, auto_topup, burndown, refund, adjustment]
+
+    WalletTransaction:
+      type: object
+      required: [id, type, amount, balance_after, created_at]
+      properties:
+        id:
+          type: string
+        type:
+          $ref: "#/components/schemas/WalletTransactionType"
+        amount:
+          $ref: "#/components/schemas/Money"
+          description: Signed movement (burndown and expiries are negative).
+        balance_after:
+          $ref: "#/components/schemas/Money"
+        payment_id:
+          type: ["string", "null"]
+          description: Linked payment for `topup`/`auto_topup`/`refund` rows.
+        period_ref:
+          type: ["string", "null"]
+          description: Aggregation-window reference for batched `burndown` rows (join key excluding wallet-burned usage from postpaid invoices).
+        description:
+          type: string
+          description: e.g. `recurring_grant`, `recurring_grant_expiry` for CR-14 adjustment rows.
+        created_at:
+          type: string
+          format: date-time
+
+    WalletTransactionList:
+      type: object
+      required: [customer_id, transactions, pagination]
+      properties:
+        customer_id:
+          type: string
+        transactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/WalletTransaction"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    Pagination:
+      type: object
+      required: [limit, offset, total]
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+          description: Total matching rows across all pages.
+
+    ApiKeyCreateRequest:
+      type: object
+      required: [org_id, name]
+      properties:
+        org_id:
+          type: string
+        name:
+          type: string
+          minLength: 3
+          maxLength: 100
+          description: Alphanumeric (spaces and dashes allowed), 3-100 characters.
+        customer_id:
+          type: string
+          description: Optional; must reference an active customer under `org_id` (`400 INVALID_CUSTOMER_ID` otherwise).
+        source_mode:
+          $ref: "#/components/schemas/SourceMode"
+          default: direct_ingest
+        budget_limit_usd:
+          $ref: "#/components/schemas/Money"
+          description: Positive spending cap in USD.
+        rate_limit_rpm:
+          type: integer
+          minimum: 1
+          description: Positive requests-per-minute threshold.
+        allowed_models:
+          type: array
+          items:
+            type: string
+
+    ApiKeySummary:
+      type: object
+      description: Listing representation — never includes the raw key or its SHA-256 hash.
+      required: [id, name, key_prefix, source_mode, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        key_prefix:
+          type: string
+          description: First 11 characters of the key (e.g. `sk-live-abc`) for identification.
+        source_mode:
+          $ref: "#/components/schemas/SourceMode"
+        status:
+          type: string
+          enum: [active, revoked]
+        budget_limit_usd:
+          oneOf:
+            - $ref: "#/components/schemas/Money"
+            - type: "null"
+        rate_limit_rpm:
+          type: ["integer", "null"]
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: ["string", "null"]
+          format: date-time
+
+    ApiKeyCreated:
+      allOf:
+        - $ref: "#/components/schemas/ApiKeySummary"
+        - type: object
+          required: [key, org_id]
+          properties:
+            key:
+              type: string
+              description: Raw unhashed key (`sk-live-` + 48 hex chars). **Shown once; never stored or retrievable again.**
+            org_id:
+              type: string
+            customer_id:
+              type: ["string", "null"]
+            allowed_models:
+              type: array
+              items:
+                type: string
+            litellm_fallback:
+              type: boolean
+              description: True when LiteLLM gateway provisioning failed/timed out and the key was generated locally instead.
+
+    ApiKeyList:
+      type: object
+      required: [keys, pagination]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/ApiKeySummary"
+        pagination:
+          $ref: "#/components/schemas/Pagination"

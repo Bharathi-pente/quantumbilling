@@ -1,0 +1,338 @@
+# =============================================================================
+# QuantumBilling — local development stack
+#
+# Generated from the story docs per ADR-001 / BUILD_PLAN:
+#   - backend/story_7_kafka_setup_and_topic_configuration.md  (Kafka KRaft + topics + UI)
+#   - backend/story_6_migrations_health_observability.md      (ClickHouse / Postgres / OTLP)
+#   - backend/phase_0_event_ingestion_pipeline.md             (Redis auth/idempotency/Bloom)
+#   - backend/phase_5_litellm_gateway_integration.md          (LiteLLM + dedicated Postgres + Prometheus)
+#   - ARCHITECTURE_DECISION.md §5                             (target topology)
+#
+# DEV ONLY. Not a production deployment: single-node Kafka, replication factor 1,
+# Keycloak in dev mode, plaintext credentials via .env defaults, no KMS
+# (BYOK master key handling per ADR-001 §7 before prod).
+#
+# Env values resolve from a local `.env` file (see .env.example).
+#
+# PROFILES (DISPATCH.md alignment):
+#   (default/core)    postgres, redis, kafka(+init/ui), clickhouse, keycloak
+#                     → required healthy at D-00
+#   gateway           litellm + litellm-postgres        → enabled at D-06
+#   observability     prometheus, otel-collector        → optional any time
+#   docker compose up -d                       # core only
+#   docker compose --profile gateway --profile observability up -d   # everything
+#
+# PATHS are for the IMPLEMENTATION MONOREPO layout (SCAFFOLD.md §1): this file is
+# copied verbatim to the monorepo root, where ClickHouse migrations live at
+# ./engine/migrations/clickhouse and infra configs at ./infra/. Running compose
+# inside the spec repo itself requires mirroring that layout first.
+# =============================================================================
+
+name: quantumbilling-dev
+
+networks:
+  event-engine-net:
+    name: event-engine-net
+    driver: bridge
+
+volumes:
+  postgres_data:
+  litellm_postgres_data:
+  redis_data:
+  kafka_data:
+  clickhouse_data:
+  keycloak_data:
+  prometheus_data:
+
+services:
+  # ---------------------------------------------------------------------------
+  # Postgres — single instance, schema-separated (ADR-001 §7.4):
+  # control plane (identity/customer/catalog/developer/...) + billing.
+  # One-writer rule enforced at the application layer.
+  # Seed AFTER migrations:  psql "$DATABASE_URL" -f scripts/seed-dev.sql
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: qb-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-quantum}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quantum-dev-password}
+      POSTGRES_DB: ${POSTGRES_DB:-quantumbilling}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - event-engine-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-quantum} -d ${POSTGRES_DB:-quantumbilling}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # LiteLLM's dedicated Postgres (Prisma-managed, separate DB per phase_5 / ERD §8)
+  # ---------------------------------------------------------------------------
+  litellm-postgres:
+    image: postgres:16
+    container_name: qb-litellm-postgres
+    profiles: ["gateway"]
+    environment:
+      POSTGRES_USER: ${LITELLM_POSTGRES_USER:-llmproxy}
+      POSTGRES_PASSWORD: ${LITELLM_POSTGRES_PASSWORD:-dbpassword9090}
+      POSTGRES_DB: ${LITELLM_POSTGRES_DB:-litellm}
+    ports:
+      - "${LITELLM_POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - litellm_postgres_data:/var/lib/postgresql/data
+    networks:
+      - event-engine-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${LITELLM_POSTGRES_USER:-llmproxy} -d ${LITELLM_POSTGRES_DB:-litellm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Redis Stack — key contexts, idempotency SETNX, existence caches, counters,
+  # wallet cache, pub/sub, AND Bloom filters for batch dedup (story_5 needs
+  # RedisBloom, hence redis-stack-server rather than plain redis).
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis/redis-stack-server:latest
+    container_name: qb-redis
+    ports:
+      - "${REDIS_HOST_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - event-engine-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Kafka — single-node KRaft mode (no ZooKeeper), per story_7.
+  # Broker-side auto-topic creation is DISABLED so clients cannot create
+  # usage-events with default partitioning before kafka-init runs (story_7 #13).
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: ee-kafka
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,EXTERNAL://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:29092,EXTERNAL://${KAFKA_ADVERTISED_HOST:-127.0.0.1}:${KAFKA_HOST_PORT:-9092}"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: ${KAFKA_NUM_PARTITIONS:-32}
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+    ports:
+      - "${KAFKA_HOST_PORT:-9092}:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - event-engine-net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # kafka-init — blocks until the broker is healthy, then pre-creates all
+  # topics per story_7 (usage-events MUST exist with exactly 32 partitions
+  # before any producer connects).
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: ee-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - event-engine-net
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        echo "Waiting for Kafka broker..."
+        until kafka-broker-api-versions --bootstrap-server kafka:29092 > /dev/null 2>&1; do sleep 2; done
+        echo "Creating topics..."
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic usage-events      --partitions 32 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic raw-events        --partitions 32 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic analytics-events  --partitions 16 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic billing-events    --partitions 16 --replication-factor 1
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic customer-aggs-1min --partitions 32 --replication-factor 1 --config cleanup.policy=compact
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic customer-aggs-5min --partitions 16 --replication-factor 1 --config cleanup.policy=compact
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic enduser-aggs-1min  --partitions 32 --replication-factor 1 --config cleanup.policy=compact
+        kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic enduser-aggs-5min  --partitions 16 --replication-factor 1 --config cleanup.policy=compact
+        echo "Topic list:"
+        kafka-topics --bootstrap-server kafka:29092 --list
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # Kafka UI (Provectus) — partition administration + topic inspection (story_7)
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: ee-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: event-engine
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    ports:
+      - "${KAFKA_UI_PORT:-8085}:8080"
+    networks:
+      - event-engine-net
+    healthcheck:
+      # Kafka UI is a Spring Boot app; prefer its actuator health endpoint.
+      test: ["CMD-SHELL", "(command -v wget >/dev/null 2>&1 && wget -qO- http://localhost:8080/actuator/health || command -v curl >/dev/null 2>&1 && curl -fsS http://localhost:8080/actuator/health || command -v python3 >/dev/null 2>&1 && python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/actuator/health')\") | grep -q '\"status\":\"UP\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # ClickHouse — usage source of truth (events.usage_events + dedup view).
+  # Native protocol 9000 (batch inserts, story_9), HTTP 8123 (ping/queries).
+  # The migrations dir is mounted into docker-entrypoint-initdb.d so the
+  # `events` database + table + view exist on first boot.
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: qb-clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-events}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./engine/migrations/clickhouse:/docker-entrypoint-initdb.d:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - event-engine-net
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Keycloak — dev mode with realm import (Phase CP-2). A minimal realm export
+  # ships at ./infra/keycloak/quantumbilling-realm.json (roles + bff client);
+  # D-01 extends it with clients/flows as needed.
+  # ---------------------------------------------------------------------------
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: qb-keycloak
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_HTTP_PORT: "8080"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "${KEYCLOAK_HOST_PORT:-8080}:8080"
+    volumes:
+      - keycloak_data:/opt/keycloak/data
+      - ./infra/keycloak:/opt/keycloak/data/import:ro
+    networks:
+      - event-engine-net
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && cat <&3 | grep -q '200' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # LiteLLM proxy gateway (Phase 5) — Mode B (virtual key) / Mode C (BYOK).
+  # Runs non-root; depends on its dedicated Postgres. A minimal routing config
+  # ships at ./infra/litellm/proxy_server_config.yaml; D-06 replaces it.
+  # Profile `gateway`: enabled at dispatch unit D-06.
+  # ---------------------------------------------------------------------------
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: qb-litellm
+    profiles: ["gateway"]
+    user: "1000:1000"   # non-root (dev); prod images should use the non_root variant
+    depends_on:
+      litellm-postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${LITELLM_DATABASE_URL:-postgresql://llmproxy:dbpassword9090@litellm-postgres:5432/litellm}
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:-sk-litellm-dev-master-key}
+      LITELLM_LOG_LEVEL: ${LITELLM_LOG_LEVEL:-INFO}
+      STORE_MODEL_IN_DB: ${STORE_MODEL_IN_DB:-True}
+      EVENT_ENGINE_INGEST_URL: ${EVENT_ENGINE_INGEST_URL:-http://host.docker.internal:8011/v1/events}
+      BYOK_MASTER_KEY: ${BYOK_MASTER_KEY:-dev-only-insecure-byok-master-key}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    command: ["--config", "/app/proxy_server_config.yaml", "--port", "4000"]
+    ports:
+      - "${LITELLM_PORT:-4000}:4000"
+    volumes:
+      - ./infra/litellm/proxy_server_config.yaml:/app/proxy_server_config.yaml:ro
+    networks:
+      - event-engine-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness')\" || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Prometheus — scrapes LiteLLM /metrics (phase_5 #26) and app services.
+  # Minimal scrape config at ./infra/prometheus/prometheus.yml (referenced).
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: qb-prometheus
+    profiles: ["observability"]
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - prometheus_data:/prometheus
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - event-engine-net
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry Collector — OTLP trace sink for ingest-api / workers (story_6).
+  # Minimal pipeline config at ./infra/otel/otel-collector-config.yaml (referenced).
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: ee-otel-collector
+    profiles: ["observability"]
+    command: ["--config", "/etc/otel/config.yaml"]
+    ports:
+      - "${OTEL_GRPC_PORT:-4317}:4317"   # OTLP gRPC
+      - "${OTEL_HTTP_PORT:-4318}:4318"   # OTLP HTTP (default OTEL_EXPORTER_OTLP_ENDPOINT)
+    volumes:
+      - ./infra/otel/otel-collector-config.yaml:/etc/otel/config.yaml:ro
+    networks:
+      - event-engine-net

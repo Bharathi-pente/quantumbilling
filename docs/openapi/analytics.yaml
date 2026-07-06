@@ -1,0 +1,1219 @@
+openapi: 3.1.0
+info:
+  title: QuantumBilling Analytics & Reporting API
+  version: 0.1.0
+  description: |
+    Phase 4 read-path aggregation and reporting APIs of the Go event engine,
+    covering organization/customer/end-user summaries, usage breakdowns,
+    time-series trends, model/service analytics, and cost reporting.
+
+    This specification is derived from the story documents and ADR-001
+    (`ARCHITECTURE_DECISION.md`, 2026-07-01):
+    `backend/phase_4_aggregation_analytics_reporting_apis.md` and
+    `backend/story_15` through `backend/story_19`. Paths follow the ADR-001 §2.1
+    vocabulary rename (`tenant` → `customer`, `user` → `end_user`).
+
+    **Data source.** Every endpoint aggregates the ClickHouse deduplicated view
+    `events.usage_events_dedup_v` (`argMax(column, ingested_at)` grouped by
+    `(org_id, customer_id, event_id)`) under a strict 5-second query deadline —
+    never the raw events table, never Postgres or Redis.
+
+    **Authentication.** Per ADR-001 §2, these APIs are not exposed for direct
+    external access. They accept service-to-service calls only, from the NestJS
+    BFF, carrying a BFF-signed JWT in `X-QB-Service-Token`. The BFF validates the
+    end user's Keycloak JWT and forwards the resolved scope in the trusted headers
+    `X-QB-Org-Id`, `X-QB-Customer-Id`, and `X-QB-Role` (required on all scoped
+    endpoints). RBAC: `platform_admin` reads globally; `org_manager` is confined
+    to their `org_id`; `customer_user` is confined to their `org_id` +
+    `customer_id`. Scope violations return `403 UNAUTHORIZED_ACCESS`.
+
+    **Zero-fill / empty-window guarantee.** No endpoint ever returns `404` or
+    `null` collections for an empty query window: empty results are `200 OK` with
+    zeroed totals (`total_events: 0`, `total_cost: "0.000000"`) and empty arrays.
+    Time-series endpoints additionally **zero-fill every interval** in the
+    requested range so the returned series is continuous (no gaps) and sorted
+    ascending — a range with no events at all returns one zeroed point per
+    bucket.
+
+    **Conventions.** Date-range filtering uses `from`/`to` (`YYYY-MM-DD`,
+    inclusive, `from ≤ to`). Bucket granularity is expressed in the path for the
+    trend family (`/v1/analytics/hourly|daily|weekly|monthly`); bucket timestamps
+    are ISO-8601 UTC at the start of the interval. Token counts are reported by
+    type (`input_tokens`, `output_tokens`, `thinking_tokens`, `total_tokens`);
+    all costs are decimal strings (e.g. `"0.045000"`, default currency USD);
+    request counts are integers.
+tags:
+  - name: Organizations
+    description: Org-level summaries, breakdowns, and costs (Stories 15, 19).
+  - name: Customers
+    description: Customer-level summaries, per-end-user breakdowns, and costs (Stories 15, 19).
+  - name: EndUsers
+    description: End-user analytics and daily activity (Story 16).
+  - name: Trends
+    description: Time-series trends bucketed hourly/daily/weekly/monthly (Story 17). Continuous zero-filled series.
+  - name: Models
+    description: Model and service-provider usage analytics and comparison (Story 18).
+  - name: Costs
+    description: Financial cost reporting (Story 19).
+servers:
+  - url: "{scheme}://{host}"
+    variables:
+      scheme:
+        default: https
+      host:
+        default: event-engine.internal:8011
+
+security:
+  - ServiceToken: []
+
+paths:
+  /v1/orgs/{org_id}/summary:
+    get:
+      operationId: getOrgSummary
+      tags: [Organizations]
+      summary: Organization usage summary
+      description: |
+        Overall metrics for an organization: total events (`count()`), tokens by
+        type (`sum()`), precision-safe cost (`sum(toDecimal64OrZero(cost))`),
+        models used, and first/last event timestamps (`min/max(timestamp_ms)` as
+        ISO-8601). Empty windows return zeroed totals and empty arrays — never
+        `404`.
+      parameters:
+        - $ref: "#/components/parameters/OrgIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Organization summary (zeroed when no events match).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrgSummary"
+              example:
+                org_id: "org_acme"
+                totals:
+                  requests_count: 100
+                  input_tokens: 90000
+                  output_tokens: 60000
+                  thinking_tokens: 0
+                  total_tokens: 150000.0
+                  cost: "4.500000"
+                models_used: ["gpt-4", "claude-3-opus"]
+                first_event: "2026-06-25T08:00:00Z"
+                last_event: "2026-06-29T12:00:00Z"
+                days_active: 5
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/orgs/{org_id}/customers/usage:
+    get:
+      operationId: getOrgCustomersUsage
+      tags: [Organizations]
+      summary: Paginated usage breakdown by customer
+      description: |
+        Token usage, request counts, and cost per customer under the org,
+        paginated. Empty windows return `200` with zeroed totals and an empty
+        `series` — never `404` or `null`.
+      parameters:
+        - $ref: "#/components/parameters/OrgIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Per-customer usage breakdown with grand totals and pagination metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageBreakdownPage"
+              example:
+                totals:
+                  requests_count: 160
+                  input_tokens: 14000
+                  output_tokens: 6000
+                  thinking_tokens: 0
+                  total_tokens: 20000.0
+                  cost: "0.600000"
+                series:
+                  - group_value: "customer_1"
+                    requests_count: 120
+                    input_tokens: 11000
+                    output_tokens: 4500
+                    thinking_tokens: 0
+                    total_tokens: 15500.0
+                    cost: "0.465000"
+                  - group_value: "customer_2"
+                    requests_count: 40
+                    input_tokens: 3000
+                    output_tokens: 1500
+                    thinking_tokens: 0
+                    total_tokens: 4500.0
+                    cost: "0.135000"
+                pagination:
+                  limit: 100
+                  offset: 0
+                  total: 2
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/orgs/{org_id}/models/usage:
+    get:
+      operationId: getOrgModelsUsage
+      tags: [Organizations]
+      summary: Usage breakdown by AI model for the organization
+      description: Token usage, request counts, and cost grouped by model name. Empty windows return zeroed totals and an empty `series` — never `404`.
+      parameters:
+        - $ref: "#/components/parameters/OrgIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Per-model usage breakdown with grand totals (`group_value` = model name).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageBreakdown"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/customers/{customer_id}/summary:
+    get:
+      operationId: getCustomerSummary
+      tags: [Customers]
+      summary: Customer usage summary
+      description: Overall metrics for a single customer (same shape as the org summary, scoped to `customer_id`). Cross-org access returns `403 UNAUTHORIZED_ACCESS`. Empty windows return zeroed totals — never `404`.
+      parameters:
+        - $ref: "#/components/parameters/CustomerIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Customer summary (zeroed when no events match).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomerSummary"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/customers/{customer_id}/users/usage:
+    get:
+      operationId: getCustomerUsersUsage
+      tags: [Customers]
+      summary: Paginated usage breakdown by end user for a customer
+      description: Token usage, request counts, and cost per end user under the customer, paginated (`group_value` = `end_user_id`). Empty windows return zeroed totals and an empty `series` — never `404`.
+      parameters:
+        - $ref: "#/components/parameters/CustomerIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: Per-end-user usage breakdown with grand totals and pagination metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageBreakdownPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/users/{end_user_id}/summary:
+    get:
+      operationId: getEndUserSummary
+      tags: [EndUsers]
+      summary: End-user usage summary
+      description: |
+        Overall metrics for a single end user, including the API error rate
+        (`countIf(status != 'success') / count() * 100`, `0.0` when there are no
+        requests). `org_id` is mandatory unless the caller is a Platform
+        Administrator (`400 MISSING_ORG_ID` otherwise). Empty windows return
+        zeroed totals and `error_rate: 0.0` — never `404`.
+      parameters:
+        - $ref: "#/components/parameters/EndUserIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: End-user summary (zeroed when no events match).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EndUserSummary"
+              example:
+                end_user_id: "user_joe"
+                org_id: "org_acme"
+                totals:
+                  requests_count: 60
+                  input_tokens: 8000
+                  output_tokens: 4000
+                  thinking_tokens: 0
+                  total_tokens: 12000.0
+                  cost: "0.360000"
+                first_request: "2026-06-28T09:00:00Z"
+                last_request: "2026-06-29T17:00:00Z"
+                error_rate: 16.67
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/users/{end_user_id}/models/usage:
+    get:
+      operationId: getEndUserModelsUsage
+      tags: [EndUsers]
+      summary: Model usage breakdown for an end user
+      description: Per-model events, token, and cost breakdown for a single end user (`group_value` = model name). `org_id` is mandatory unless the caller is a Platform Administrator. Empty windows return an empty `series` — never `404` or `null`.
+      parameters:
+        - $ref: "#/components/parameters/EndUserIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Per-model usage breakdown with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageBreakdown"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/users/{end_user_id}/activity/daily:
+    get:
+      operationId: getEndUserDailyActivity
+      tags: [EndUsers]
+      summary: Daily activity time series for an end user
+      description: |
+        Date-bucketed activity (requests, tokens by type, cost) for a single end
+        user, sorted ascending. **Zero-fill guarantee:** every date in the
+        requested range is present — days without activity carry zeroed counts
+        and `"0.000000"` cost, so the series is continuous; an empty window still
+        returns one zeroed point per day, never `404` or `null`.
+      parameters:
+        - $ref: "#/components/parameters/EndUserIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Continuous daily series with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimeSeries"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/hourly:
+    get:
+      operationId: getHourlyTrends
+      tags: [Trends]
+      summary: Hourly usage trend
+      description: |
+        Usage bucketed by `toStartOfHour` (UTC, timestamps end `:00:00Z`).
+        Maximum range **7 days** (`400 QUERY_RANGE_TOO_LARGE` beyond).
+        **Zero-fill guarantee:** every hour in the range is present with zeroed
+        metrics when empty — the series is continuous and never `404`/`null`.
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Continuous hourly series with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimeSeries"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/daily:
+    get:
+      operationId: getDailyTrends
+      tags: [Trends]
+      summary: Daily usage trend
+      description: |
+        Usage bucketed by `toStartOfDay` (UTC). Maximum range **90 days**
+        (`400 QUERY_RANGE_TOO_LARGE` beyond). **Zero-fill guarantee:** every day
+        in the range is present with zeroed metrics when empty — the series is
+        continuous and never `404`/`null`.
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Continuous daily series with totals (gap days zero-filled).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimeSeries"
+              example:
+                granularity: "daily"
+                from: "2026-06-25"
+                to: "2026-06-27"
+                totals:
+                  requests_count: 15
+                  input_tokens: 1400
+                  output_tokens: 900
+                  thinking_tokens: 0
+                  total_tokens: 2300.0
+                  cost: "0.069000"
+                series:
+                  - timestamp: "2026-06-25T00:00:00Z"
+                    requests_count: 10
+                    input_tokens: 900
+                    output_tokens: 600
+                    thinking_tokens: 0
+                    total_tokens: 1500.0
+                    cost: "0.045000"
+                  - timestamp: "2026-06-26T00:00:00Z"
+                    requests_count: 0
+                    input_tokens: 0
+                    output_tokens: 0
+                    thinking_tokens: 0
+                    total_tokens: 0.0
+                    cost: "0.000000"
+                  - timestamp: "2026-06-27T00:00:00Z"
+                    requests_count: 5
+                    input_tokens: 500
+                    output_tokens: 300
+                    thinking_tokens: 0
+                    total_tokens: 800.0
+                    cost: "0.024000"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/weekly:
+    get:
+      operationId: getWeeklyTrends
+      tags: [Trends]
+      summary: Weekly usage trend
+      description: Usage bucketed by `toStartOfWeek` (UTC). Range unlimited. **Zero-fill guarantee:** every week in the range is present with zeroed metrics when empty — the series is continuous and never `404`/`null`.
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Continuous weekly series with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimeSeries"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/monthly:
+    get:
+      operationId: getMonthlyTrends
+      tags: [Trends]
+      summary: Monthly usage trend
+      description: Usage bucketed by `toStartOfMonth` (UTC). Range unlimited. **Zero-fill guarantee:** every month in the range is present with zeroed metrics when empty — the series is continuous and never `404`/`null`.
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Continuous monthly series with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimeSeries"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/models:
+    get:
+      operationId: getModelUsage
+      tags: [Models]
+      summary: Usage distribution by model
+      description: Requests, tokens by type, cost, and percentage share of total org tokens per model. Empty windows return zeroed totals and an empty `series` — never `404` or `null`.
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Per-model distribution with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelUsageReport"
+              example:
+                totals:
+                  requests_count: 100
+                  input_tokens: 14000
+                  output_tokens: 6000
+                  thinking_tokens: 0
+                  total_tokens: 20000.0
+                  cost: "0.600000"
+                series:
+                  - model: "gpt-4"
+                    requests_count: 80
+                    input_tokens: 11000
+                    output_tokens: 5000
+                    thinking_tokens: 0
+                    total_tokens: 16000.0
+                    cost: "0.480000"
+                    percentage_share: 80.0
+                    error_rate: 0.0
+                  - model: "claude-3"
+                    requests_count: 20
+                    input_tokens: 3000
+                    output_tokens: 1000
+                    thinking_tokens: 0
+                    total_tokens: 4000.0
+                    cost: "0.120000"
+                    percentage_share: 20.0
+                    error_rate: 5.0
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/services:
+    get:
+      operationId: getServiceUsage
+      tags: [Models]
+      summary: Usage metrics by service provider
+      description: Requests, tokens by type, cost, and error rate grouped by upstream provider/service name (`openai`, `anthropic`, `google`, ...). Empty windows return zeroed totals and an empty `series` — never `404` or `null`.
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Per-provider metrics with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceUsageReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/models/compare:
+    get:
+      operationId: compareModels
+      tags: [Models]
+      summary: Comparative model analytics
+      description: |
+        Side-by-side model comparison: token-share ratios (percentage of total org
+        tokens per model) and per-model error percentages
+        (`countIf(status != 'success') / count() * 100`, division-by-zero safe).
+        Empty windows return zeroed totals and an empty `series` — never `404` or
+        `null`.
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Comparative per-model metrics with totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelUsageReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/orgs/{org_id}/costs:
+    get:
+      operationId: getOrgCosts
+      tags: [Costs]
+      summary: Organization cost report
+      description: |
+        Precision-safe cost totals (`sum(toDecimal128(cost, 6))`) for an
+        organization, optionally grouped via `breakdown_by`
+        (`customer` | `model` | `end_user` | `service`; other values →
+        `400 INVALID_BREAKDOWN_FILTER`). `currency` is always returned
+        (default `USD`). Empty windows return `total_cost: "0.000000"` and empty
+        `breakdowns` — never `404` or `null`.
+      parameters:
+        - $ref: "#/components/parameters/OrgIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - name: breakdown_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [customer, model, end_user, service]
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Cost report with optional grouped breakdown.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CostReport"
+              example:
+                org_id: "org_acme"
+                currency: "USD"
+                total_cost: "75.750000"
+                breakdown_by: "customer"
+                breakdowns:
+                  - group_value: "customer_1"
+                    cost: "50.500000"
+                    percentage: 66.67
+                  - group_value: "customer_2"
+                    cost: "25.250000"
+                    percentage: 33.33
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/customers/{customer_id}/costs:
+    get:
+      operationId: getCustomerCosts
+      tags: [Costs]
+      summary: Customer cost report
+      description: >-
+        Cost report for a single customer, optionally filtered by `end_user_id`
+        or `model`. Cross-org access returns `403 UNAUTHORIZED_ACCESS`. Empty
+        windows return `total_cost: "0.000000"` and empty `breakdowns` — never
+        `404` or `null`.
+      parameters:
+        - $ref: "#/components/parameters/CustomerIdPath"
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - name: end_user_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: model
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: breakdown_by
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [model, end_user, service]
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Cost report scoped to the customer.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CostReport"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /v1/analytics/costs/daily:
+    get:
+      operationId: getDailyCosts
+      tags: [Costs]
+      summary: Daily cost trend
+      description: |
+        Daily cost series for billing charts. **Zero-fill guarantee:** every date
+        in the range is present, sorted ascending; dates with no activity carry
+        `"0.000000"` — the series is continuous and an empty window returns one
+        zeroed point per day, never `404` or `null`. `currency` is explicit on
+        every point (default `USD`).
+      parameters:
+        - $ref: "#/components/parameters/XQBOrgId"
+        - $ref: "#/components/parameters/XQBCustomerId"
+        - $ref: "#/components/parameters/XQBRole"
+        - $ref: "#/components/parameters/OrgIdQuery"
+        - $ref: "#/components/parameters/CustomerIdQuery"
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+      responses:
+        "200":
+          description: Continuous daily cost series with a grand total.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DailyCostSeries"
+              example:
+                currency: "USD"
+                total_cost: "15.000000"
+                series:
+                  - date: "2026-06-25"
+                    cost: "10.000000"
+                    currency: "USD"
+                  - date: "2026-06-26"
+                    cost: "0.000000"
+                    currency: "USD"
+                  - date: "2026-06-27"
+                    cost: "5.000000"
+                    currency: "USD"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+components:
+  securitySchemes:
+    ServiceToken:
+      type: apiKey
+      in: header
+      name: X-QB-Service-Token
+      description: |
+        BFF-signed JWT for service-to-service authentication (ADR-001 §2, Phase 4
+        Authentication). Only the NestJS BFF calls these APIs: it validates the
+        end user's Keycloak JWT and forwards the resolved scope in the trusted
+        headers `X-QB-Org-Id`, `X-QB-Customer-Id`, and `X-QB-Role`, which the Go
+        layer treats as the authenticated context and enforces per the RBAC
+        matrix (platform_admin: global; org_manager: own org; customer_user: own
+        org + customer). These headers are required on all scoped endpoints.
+
+  parameters:
+    OrgIdPath:
+      name: org_id
+      in: path
+      required: true
+      description: Organization ID. Empty/malformed values return `400 INVALID_IDENTIFIER`.
+      schema:
+        type: string
+    CustomerIdPath:
+      name: customer_id
+      in: path
+      required: true
+      description: Canonical customer ID (`customer.customers.id`, ADR-001 §2.1).
+      schema:
+        type: string
+    EndUserIdPath:
+      name: end_user_id
+      in: path
+      required: true
+      description: Canonical end-user ID (`customer.end_users.id`, ADR-001 §2.1).
+      schema:
+        type: string
+    OrgIdQuery:
+      name: org_id
+      in: query
+      required: false
+      description: Org scope filter. Mandatory unless the caller is a Platform Administrator (`400 MISSING_ORG_ID` otherwise); must match the `X-QB-Org-Id` scope for non-admins (`403 UNAUTHORIZED_ACCESS` otherwise).
+      schema:
+        type: string
+    CustomerIdQuery:
+      name: customer_id
+      in: query
+      required: false
+      description: Optional customer filter; strictly enforced against the trusted-header scope for Customer User callers.
+      schema:
+        type: string
+    From:
+      name: from
+      in: query
+      required: false
+      description: Start of the date range (inclusive), `YYYY-MM-DD` ISO-8601. Malformed values → `400 INVALID_DATE_FORMAT`; must be ≤ `to` → `400 INVALID_DATE_RANGE`.
+      schema:
+        type: string
+        format: date
+    To:
+      name: to
+      in: query
+      required: false
+      description: End of the date range (inclusive), `YYYY-MM-DD` ISO-8601.
+      schema:
+        type: string
+        format: date
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size (default 100, max 1000). Negative/out-of-bounds → `400 INVALID_PAGINATION`.
+      schema:
+        type: integer
+        default: 100
+        minimum: 1
+        maximum: 1000
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Page offset (default 0). Negative → `400 INVALID_PAGINATION`.
+      schema:
+        type: integer
+        default: 0
+        minimum: 0
+    XQBOrgId:
+      name: X-QB-Org-Id
+      in: header
+      required: true
+      description: Trusted scope header set by the NestJS BFF — the caller's resolved organization ID. Required on all scoped endpoints.
+      schema:
+        type: string
+    XQBCustomerId:
+      name: X-QB-Customer-Id
+      in: header
+      required: false
+      description: Trusted scope header set by the NestJS BFF — the caller's resolved customer ID (present for Customer User scope).
+      schema:
+        type: string
+    XQBRole:
+      name: X-QB-Role
+      in: header
+      required: true
+      description: Trusted scope header set by the NestJS BFF — resolved RBAC role.
+      schema:
+        type: string
+        enum: [platform_admin, org_manager, customer_user]
+
+  responses:
+    BadRequest:
+      description: "Invalid parameters: `INVALID_IDENTIFIER`, `INVALID_DATE_FORMAT`, `INVALID_DATE_RANGE`, `INVALID_PAGINATION`, `QUERY_RANGE_TOO_LARGE`, `INVALID_BREAKDOWN_FILTER`, or `MISSING_ORG_ID`."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: "`UNAUTHORIZED` — missing or invalid `X-QB-Service-Token` (only the NestJS BFF may call these APIs)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: "`UNAUTHORIZED_ACCESS` — the trusted-header scope does not match the requested org/customer (multi-tenant isolation)."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: "UNAUTHORIZED_ACCESS"
+              message: "caller scope org_acme cannot access org_different"
+
+  schemas:
+    Error:
+      type: object
+      description: Standard error envelope shared across the platform.
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                Machine-readable error code from the story docs, e.g.
+                `INVALID_IDENTIFIER`, `INVALID_DATE_FORMAT`, `INVALID_DATE_RANGE`,
+                `INVALID_PAGINATION`, `QUERY_RANGE_TOO_LARGE`,
+                `INVALID_BREAKDOWN_FILTER`, `MISSING_ORG_ID`,
+                `UNAUTHORIZED_ACCESS`, `UNAUTHORIZED`.
+            message:
+              type: string
+            details:
+              type: object
+              description: Optional structured context (e.g. the offending parameter and value).
+              additionalProperties: true
+
+    Money:
+      type: string
+      description: Decimal amount serialized as a string (e.g. `"0.045000"`), summed precision-safely in ClickHouse (`toDecimal64OrZero`/`toDecimal128`). Default currency is USD.
+      examples: ["0.045000"]
+
+    TokenTotals:
+      type: object
+      description: Aggregate usage metrics — request counts, tokens by type, and precision-safe cost. All fields are zero (`0`, `0.0`, `"0.000000"`) for empty windows.
+      required: [requests_count, total_tokens, cost]
+      properties:
+        requests_count:
+          type: integer
+          description: Number of deduplicated events.
+        input_tokens:
+          type: integer
+          description: Sum of prompt tokens.
+        output_tokens:
+          type: integer
+          description: Sum of completion tokens.
+        thinking_tokens:
+          type: integer
+          description: Sum of reasoning tokens (providers that separate them).
+        total_tokens:
+          type: number
+          description: Sum of total tokens.
+        cost:
+          $ref: "#/components/schemas/Money"
+
+    SeriesPoint:
+      allOf:
+        - type: object
+          required: [timestamp]
+          properties:
+            timestamp:
+              type: string
+              format: date-time
+              description: Start of the interval, ISO-8601 UTC (e.g. `2026-06-29T10:00:00Z`).
+        - $ref: "#/components/schemas/TokenTotals"
+
+    TimeSeries:
+      type: object
+      description: Totals plus a continuous, ascending, zero-filled series — one point per interval in the requested range, including empty intervals.
+      required: [granularity, totals, series]
+      properties:
+        granularity:
+          type: string
+          enum: [hourly, daily, weekly, monthly]
+        from:
+          type: string
+          format: date
+        to:
+          type: string
+          format: date
+        totals:
+          $ref: "#/components/schemas/TokenTotals"
+        series:
+          type: array
+          items:
+            $ref: "#/components/schemas/SeriesPoint"
+
+    UsageBreakdownItem:
+      allOf:
+        - type: object
+          required: [group_value]
+          properties:
+            group_value:
+              type: string
+              description: The grouped dimension value (customer ID, end-user ID, or model name depending on the endpoint).
+        - $ref: "#/components/schemas/TokenTotals"
+
+    UsageBreakdown:
+      type: object
+      description: >-
+        Grand totals plus one series entry per group. Empty windows yield zeroed
+        totals and `series: []`.
+      required: [totals, series]
+      properties:
+        totals:
+          $ref: "#/components/schemas/TokenTotals"
+        series:
+          type: array
+          items:
+            $ref: "#/components/schemas/UsageBreakdownItem"
+
+    UsageBreakdownPage:
+      allOf:
+        - $ref: "#/components/schemas/UsageBreakdown"
+        - type: object
+          required: [pagination]
+          properties:
+            pagination:
+              $ref: "#/components/schemas/Pagination"
+
+    Pagination:
+      type: object
+      required: [limit, offset, total]
+      properties:
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+          description: Total matching groups across all pages.
+
+    OrgSummary:
+      type: object
+      required: [org_id, totals]
+      properties:
+        org_id:
+          type: string
+        totals:
+          $ref: "#/components/schemas/TokenTotals"
+        models_used:
+          type: array
+          description: Distinct models seen in the window (`[]` when empty).
+          items:
+            type: string
+        first_event:
+          type: ["string", "null"]
+          format: date-time
+          description: "`min(timestamp_ms)` as ISO-8601; null/empty for empty windows."
+        last_event:
+          type: ["string", "null"]
+          format: date-time
+        days_active:
+          type: integer
+
+    CustomerSummary:
+      type: object
+      required: [customer_id, totals]
+      properties:
+        customer_id:
+          type: string
+        org_id:
+          type: string
+        totals:
+          $ref: "#/components/schemas/TokenTotals"
+        models_used:
+          type: array
+          items:
+            type: string
+        first_event:
+          type: ["string", "null"]
+          format: date-time
+        last_event:
+          type: ["string", "null"]
+          format: date-time
+        days_active:
+          type: integer
+
+    EndUserSummary:
+      type: object
+      required: [end_user_id, totals, error_rate]
+      properties:
+        end_user_id:
+          type: string
+        org_id:
+          type: string
+        totals:
+          $ref: "#/components/schemas/TokenTotals"
+        first_request:
+          type: ["string", "null"]
+          format: date-time
+        last_request:
+          type: ["string", "null"]
+          format: date-time
+        error_rate:
+          type: number
+          description: "`countIf(status != 'success') / count() * 100`; `0.0` when there are no requests."
+
+    ModelUsageItem:
+      allOf:
+        - type: object
+          required: [model]
+          properties:
+            model:
+              type: string
+            percentage_share:
+              type: number
+              description: Percentage of total org tokens consumed by this model in the window.
+            error_rate:
+              type: number
+              description: Per-model error percentage (division-by-zero safe).
+        - $ref: "#/components/schemas/TokenTotals"
+
+    ModelUsageReport:
+      type: object
+      required: [totals, series]
+      properties:
+        totals:
+          $ref: "#/components/schemas/TokenTotals"
+        series:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelUsageItem"
+
+    ServiceUsageItem:
+      allOf:
+        - type: object
+          required: [service]
+          properties:
+            service:
+              type: string
+              description: Upstream provider/service name (`openai`, `anthropic`, `google`, ...).
+            error_rate:
+              type: number
+        - $ref: "#/components/schemas/TokenTotals"
+
+    ServiceUsageReport:
+      type: object
+      required: [totals, series]
+      properties:
+        totals:
+          $ref: "#/components/schemas/TokenTotals"
+        series:
+          type: array
+          items:
+            $ref: "#/components/schemas/ServiceUsageItem"
+
+    CostBreakdownItem:
+      type: object
+      required: [group_value, cost]
+      properties:
+        group_value:
+          type: string
+          description: The grouped dimension value per `breakdown_by`.
+        cost:
+          $ref: "#/components/schemas/Money"
+        percentage:
+          type: number
+          description: Share of the total cost.
+
+    CostReport:
+      type: object
+      description: >-
+        Precision-safe cost totals with optional grouped breakdown. Empty windows
+        yield `total_cost: "0.000000"` and `breakdowns: []`.
+      required: [currency, total_cost, breakdowns]
+      properties:
+        org_id:
+          type: string
+        customer_id:
+          type: string
+        currency:
+          type: string
+          default: USD
+          description: Always explicit in the payload (multi-currency readiness).
+        total_cost:
+          $ref: "#/components/schemas/Money"
+        breakdown_by:
+          type: ["string", "null"]
+          enum: [customer, model, end_user, service, null]
+        breakdowns:
+          type: array
+          items:
+            $ref: "#/components/schemas/CostBreakdownItem"
+
+    DailyCostPoint:
+      type: object
+      required: [date, cost, currency]
+      properties:
+        date:
+          type: string
+          format: date
+        cost:
+          $ref: "#/components/schemas/Money"
+        currency:
+          type: string
+          default: USD
+
+    DailyCostSeries:
+      type: object
+      description: Grand total plus a continuous, ascending, zero-filled daily cost series (gap dates carry `"0.000000"`).
+      required: [currency, total_cost, series]
+      properties:
+        currency:
+          type: string
+          default: USD
+        total_cost:
+          $ref: "#/components/schemas/Money"
+        series:
+          type: array
+          items:
+            $ref: "#/components/schemas/DailyCostPoint"
