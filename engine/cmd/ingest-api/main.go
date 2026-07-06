@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pente/quantumbilling/engine/internal/auth"
+	"github.com/pente/quantumbilling/engine/internal/daemon"
 	"github.com/pente/quantumbilling/engine/internal/handler"
 	"github.com/redis/go-redis/v9"
 
@@ -51,7 +52,15 @@ func main() {
 
 	ingestMux := http.NewServeMux()
 	ingestMux.HandleFunc("/v1/events", ingestHandler.HandleSingleEvent)
-	mux.Handle("/v1/events", auth.AuthMiddleware(rdb, logger)(ingestMux))
+	ingestMux.HandleFunc("/v1/events/batch", ingestHandler.HandleBatchEvent)
+	mux.Handle("/v1/", auth.AuthMiddleware(rdb, logger)(ingestMux))
+
+	// Start cache sync daemon (story_3)
+	if pg != nil {
+		cacheDaemon := daemon.New(pg, rdb, logger)
+		cacheDaemon.Start(context.Background())
+		logger.Info("cache daemon started", "sync_interval", cacheDaemon.Interval)
+	}
 
 	srv := &http.Server{
 		Addr:         ":" + port,
