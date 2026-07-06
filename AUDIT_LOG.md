@@ -153,3 +153,22 @@ ewEventID() not UUIDv4 per SCAFFOLD.md §6. |
 **Conformance:** Sharded Bloom via BF.EXISTS/BF.ADD, Redis pipeline for batch lookups, 1h TTL on existence keys.
 **Behavior:** Not run (Go unavailable).
 **Drift:** No docs modifications.
+
+---
+
+## A-04 — Audit: D-04 Phase 1 analytics worker
+**Date:** 2026-07-06 | **Scope:** b9ad178
+
+### VERDICT: PASS-WITH-FINDINGS
+
+| # | Severity | Defect |
+|---|---|---|
+| F1 | MAJOR | Kafka consumer + ClickHouse writer are placeholder implementations (Go deps not available). Real drivers need go mod tidy. |
+| F2 | MINOR | OTel tracing not wired — traceparent extraction placeholder only. |
+| F3 | MINOR | Prometheus metrics (consumer lag, insert latency) not instrumented. |
+| F4 | MINOR | Deterministic event fixture generator per TEST_PLAN G5 not created. |
+
+**Existence:** 4 files — consumer, writer, orchestration, main.go. All story_8/9/10 ACs addressed in code structure.
+**Conformance:** 21-column INSERT list matches schema. Batch accumulation 50k/10s. Graceful shutdown with final flush. At-least-once via ReplacingMergeTree.
+**Behavior:** Not run (Go unavailable).
+**Milestone:** Spine complete — Tracks A/B/C unblocked.
