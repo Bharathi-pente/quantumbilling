@@ -1,23 +1,57 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"database/sql"
+	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
+
+	"github.com/pente/quantumbilling/engine/internal/auth"
+	"github.com/pente/quantumbilling/engine/internal/handler"
+	"github.com/redis/go-redis/v9"
+
+	_ "github.com/lib/pq"
 )
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8011"
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	port := envOrDefault("PORT", "8011")
+
+	redisAddr := envOrDefault("REDIS_ADDR", "localhost:6379")
+	rdb := redis.NewClient(&redis.Options{
+		Addr:        redisAddr,
+		Password:    os.Getenv("REDIS_PASSWORD"),
+		DB:          0,
+		DialTimeout: 2 * time.Second,
+	})
+
+	pgDSN := envOrDefault("DATABASE_URL", "postgresql://quantum:quantum-dev-password@localhost:5432/quantumbilling?sslmode=disable")
+	pg, err := sql.Open("postgres", pgDSN)
+	if err != nil {
+		logger.Warn("postgres not available", "error", err)
+		pg = nil
+	} else {
+		pg.SetMaxOpenConns(5)
+		pg.SetMaxIdleConns(2)
 	}
+
+	ingestHandler := handler.NewIngestHandler(rdb, pg, logger)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/ready", readyHandler)
+
+	ingestMux := http.NewServeMux()
+	ingestMux.HandleFunc("/v1/events", ingestHandler.HandleSingleEvent)
+	mux.Handle("/v1/events", auth.AuthMiddleware(rdb, logger)(ingestMux))
 
 	srv := &http.Server{
 		Addr:         ":" + port,
@@ -27,55 +61,45 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("ingest-api listening on :%s", port)
-	if err := srv.ListenAndServe(); err != nil {
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		logger.Info("shutting down...")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
+	logger.Info("ingest-api listening", "port", port)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	fmt.Fprint(w, `{"status":"ok"}`)
 }
 
 func readyHandler(w http.ResponseWriter, r *http.Request) {
-	// Check Postgres
-	pgOK := checkTCP(os.Getenv("PG_HOST"), os.Getenv("PG_PORT"), "5432")
-	// Check Redis
-	redisOK := checkTCP(os.Getenv("REDIS_HOST"), os.Getenv("REDIS_PORT"), "6379")
-	// Check Kafka
-	kafkaOK := checkTCP(os.Getenv("KAFKA_HOST"), os.Getenv("KAFKA_PORT"), "9092")
+	pgOK := checkTCP(envOrDefault("PG_HOST", "localhost"), envOrDefault("PG_PORT", "5432"))
+	redisOK := checkTCP(envOrDefault("REDIS_HOST", "localhost"), envOrDefault("REDIS_PORT", "6379"))
+	kafkaOK := checkTCP(envOrDefault("KAFKA_HOST", "localhost"), envOrDefault("KAFKA_PORT", "9092"))
 
 	allOK := pgOK && redisOK && kafkaOK
-	deps := map[string]string{
-		"postgres": boolStatus(pgOK),
-		"redis":    boolStatus(redisOK),
-		"kafka":    boolStatus(kafkaOK),
+	status := http.StatusOK
+	if !allOK {
+		status = http.StatusServiceUnavailable
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if allOK {
-		w.WriteHeader(http.StatusOK)
-	} else {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":      boolStatus(allOK),
-		"dependencies": deps,
-	})
+	w.WriteHeader(status)
+	fmt.Fprintf(w, `{"status":"%s","dependencies":{"postgres":"%s","redis":"%s","kafka":"%s"}}`,
+		boolStatus(allOK), boolStatus(pgOK), boolStatus(redisOK), boolStatus(kafkaOK))
 }
 
-func checkTCP(envHost, envPort, defaultPort string) bool {
-	host := envHost
-	if host == "" {
-		host = "localhost"
-	}
-	port := envPort
-	if port == "" {
-		port = defaultPort
-	}
-
+func checkTCP(host, port string) bool {
 	conn, err := net.DialTimeout("tcp", host+":"+port, 2*time.Second)
 	if err != nil {
 		return false
@@ -85,8 +109,11 @@ func checkTCP(envHost, envPort, defaultPort string) bool {
 }
 
 func boolStatus(ok bool) string {
-	if ok {
-		return "ok"
-	}
+	if ok { return "ok" }
 	return "unavailable"
+}
+
+func envOrDefault(key, defaultVal string) string {
+	if v := os.Getenv(key); v != "" { return v }
+	return defaultVal
 }
