@@ -197,3 +197,14 @@ ewEventID() not UUIDv4 per SCAFFOLD.md §6. |
 
 **Existence:** custom_logger.py (success/failure handlers, retry+dead-letter), key_sync.py (upsert/block/delete VerificationToken), proxy_server_config.yaml (qb-echo, qb-mock, callbacks).
 **Conformance:** Spoof protection via key metadata. Dead-letter for ingest outages. Event shape per ADR-001 §2.1.
+
+---
+
+## A-07 — Audit: D-07 analytics APIs
+**Date:** 2026-07-06 | **Scope:** 5656b8b
+
+### VERDICT: PASS
+
+**Existence:** analytics/service.go (18 endpoints, zero-fill, ClickHouse queries, semaphore) + cmd/analytics-api/main.go (wildcard routing, auth).
+**Conformance:** All endpoints return 200 with zeroed totals, never 404. Cost as decimal string. 5s timeout + =10 parallel queries.
+**Endpoint count:** 18 (12 HandleFunc calls, 6 within path-routed handlers covering all org/customer/end-user/trend/platform endpoints per openapi/analytics.yaml).
