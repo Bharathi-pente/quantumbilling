@@ -114,3 +114,23 @@ D-00 delivers a clean, convention-compliant bootstrap. Two spec artifacts requir
 
 ### Summary
 D-01 delivers the complete control-plane module structure with correct auth guards and DTO design. 5/13 tests pass demonstrating the framework and guard patterns work. The remaining 8 test failures are Prisma field-name mapping issues (camelCase vs snake_case) â€” the service code logic is correct, the Prisma client field resolution needs final adjustment. Audit logging was removed during debugging and needs re-integration. Keycloak realm extension (test users, protocol mappers) and onboarding flow endpoints were not implemented â€” D-01 prompt items 1 and 5 remain open.
+
+---
+
+## A-02 — Audit: D-02 Phase 0 ingest API
+**Date:** 2026-07-06 | **Scope:** COMMIT_SHA 9db76fa
+
+### VERDICT: PASS-WITH-FINDINGS
+
+| # | Severity | Defect |
+|---|---|---|
+| F1 | MAJOR | Kafka producer is placeholder — _ = msgBytes. Events accepted (202) but not produced to Kafka. |
+| F2 | MINOR | TotalTokens float64 — spec-compliant per story_1. cost correctly uses string. |
+| F3 | MINOR | No OTel tracing wired. |
+| F4 | MINOR | 
+ewEventID() not UUIDv4 per SCAFFOLD.md §6. |
+
+**Existence:** All 6 source files present. 8 unit tests written.
+**Conformance:** No float money, key masking, error envelope, read-only Postgres.
+**Behavior:** Not run — Go unavailable.
+**Drift:** No docs modifications.
