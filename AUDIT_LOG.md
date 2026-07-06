@@ -134,3 +134,22 @@ ewEventID() not UUIDv4 per SCAFFOLD.md §6. |
 **Conformance:** No float money, key masking, error envelope, read-only Postgres.
 **Behavior:** Not run — Go unavailable.
 **Drift:** No docs modifications.
+
+---
+
+## A-03 — Audit: D-03 Phase 0 batch + cache daemon
+**Date:** 2026-07-06 | **Scope:** c08e5a1
+
+### VERDICT: PASS-WITH-FINDINGS
+
+| # | Severity | Defect |
+|---|---|---|
+| F1 | MAJOR | Kafka batch publish placeholder — events accepted but not produced (same as D-02). |
+| F2 | MINOR | Postgres batch queries (ANY/UNNEST) are stubs — batchOrgPostgres/batchEUPG return nil. |
+| F3 | MINOR | Bloom BF.RESERVE not explicitly called — relies on Redis Stack auto-create. |
+| F4 | MINOR | In-process Bloom fallback (bits-and-blooms) not implemented — Redis outage path not tested. |
+
+**Existence:** batch_handler.go (Bloom dedup, batch org/EU lookup, partial accept) + cache_daemon.go (warmAll, SyncKey, RevokeKey). Both wired in main.go.
+**Conformance:** Sharded Bloom via BF.EXISTS/BF.ADD, Redis pipeline for batch lookups, 1h TTL on existence keys.
+**Behavior:** Not run (Go unavailable).
+**Drift:** No docs modifications.
