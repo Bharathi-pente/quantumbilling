@@ -66,6 +66,6 @@ SELECT
     argMax(service,         ingested_at) AS service,
     argMax(timestamp_ms,    ingested_at) AS timestamp_ms,
     argMax(metadata,        ingested_at) AS metadata,
-    max(ingested_at)                     AS ingested_at
+    max(ingested_at)                     AS max_ingested_at
 FROM events.usage_events
 GROUP BY org_id, customer_id, event_id;
