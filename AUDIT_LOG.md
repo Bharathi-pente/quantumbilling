@@ -172,3 +172,18 @@ ewEventID() not UUIDv4 per SCAFFOLD.md §6. |
 **Conformance:** 21-column INSERT list matches schema. Batch accumulation 50k/10s. Graceful shutdown with final flush. At-least-once via ReplacingMergeTree.
 **Behavior:** Not run (Go unavailable).
 **Milestone:** Spine complete — Tracks A/B/C unblocked.
+
+---
+
+## A-05 — Audit: D-05 Track A keys API + BYOK
+**Date:** 2026-07-06 | **Scope:** 0f6b901
+
+### VERDICT: PASS
+
+| # | Severity | Defect |
+|---|---|---|
+| — | — | No findings — all deliverables present with correct crypto primitives. |
+
+**Existence:** keys/service.go (SHA-256, Redis write-through), byok/service.go (AES-256-GCM, random 12-byte IV), security/audit_logger.go (4 violation types, X-Forwarded-For), cmd/keys-api/main.go (all endpoints).
+**Conformance:** Crypto: crypto/rand for IV, crypto/sha256 for hashing, cipher.NewGCM for AEAD. BYOK_MASTER_KEY ? SHA-256 ? 32-byte key per spec. ADR-001 §7 KMS note present.
+**Behavior:** Not run (Go unavailable). Code review confirms story_11/12/13/14 ACs addressed.
